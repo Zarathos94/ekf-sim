@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eskf",
+    "crates/eskf-wasm",
+    "crates/eskf-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/Zarathos94/ekf-sim"
+authors = ["Zarathos94 <irfansaric94@gmail.com>"]
+
+[workspace.dependencies]
+eskf = { path = "crates/eskf" }
+
+# Pinned exactly: the schema is checked byte-for-byte against the wasm-bindgen CLI, and a
+# semver-compatible bump breaks the build with a version mismatch.
+wasm-bindgen = "=0.2.100"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# The wasm bundle ships to browsers over the wire, so size wins over the last few percent.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+panic = "abort"

@@ -1,0 +1,14 @@
+[package]
+name = "eskf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A quaternion error-state Kalman filter and an IMU/GPS/baro/magnetometer simulator, done right"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
