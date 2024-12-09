@@ -1,0 +1,16 @@
+[package]
+name = "eskf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Native harness: run the filter over simulated flights and check NEES consistency — the correctness gate"
+
+[[bin]]
+name = "eskf"
+path = "src/main.rs"
+
+[dependencies]
+eskf.workspace = true
