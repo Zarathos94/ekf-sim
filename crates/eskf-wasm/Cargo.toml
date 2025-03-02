@@ -1,0 +1,22 @@
+[package]
+name = "eskf-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "wasm-bindgen surface: step the simulator and filter live and hand state, ground truth and covariance to JS"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+eskf.workspace = true
+wasm-bindgen.workspace = true
+
+# Small panic messages in the browser console instead of an opaque "unreachable".
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
