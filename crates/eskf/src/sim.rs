@@ -40,8 +40,24 @@ pub struct SimConfig {
     /// Magnetometer noise, unit-vector components.
     pub mag_noise: f64,
 
-    /// When true, GPS stops arriving — the classic urban-canyon dropout.
-    pub gps_dropout: bool,
+    /// LiDAR (downward laser altimeter) noise, m, and its rate.
+    pub lidar_noise: f64,
+    pub lidar_rate: f64,
+    /// UWB / radio ranging noise, m, and its rate (one sweep of every beacon per tick).
+    pub uwb_noise: f64,
+    pub uwb_rate: f64,
+    /// Optical-flow (body-frame horizontal velocity) noise, m/s, and its rate.
+    pub flow_noise: f64,
+    pub flow_rate: f64,
+
+    /// Per-sensor enables. Turning GPS off is the urban-canyon dropout; turning UWB on is the
+    /// radio-ranging fallback that keeps the estimate alive without it.
+    pub gps_enabled: bool,
+    pub baro_enabled: bool,
+    pub mag_enabled: bool,
+    pub lidar_enabled: bool,
+    pub uwb_enabled: bool,
+    pub flow_enabled: bool,
 }
 
 impl Default for SimConfig {
@@ -58,10 +74,29 @@ impl Default for SimConfig {
             gps_noise: 0.8,
             baro_noise: 0.6,
             mag_noise: 0.02,
-            gps_dropout: false,
+            lidar_noise: 0.15,
+            lidar_rate: 25.0,
+            uwb_noise: 0.35,
+            uwb_rate: 10.0,
+            flow_noise: 0.15,
+            flow_rate: 30.0,
+            gps_enabled: true,
+            baro_enabled: true,
+            mag_enabled: true,
+            lidar_enabled: true,
+            uwb_enabled: false,
+            flow_enabled: false,
         }
     }
 }
+
+/// Fixed radio-ranging beacons (UWB anchors) at known world positions, m.
+pub const BEACONS: [V3; 4] = [
+    [-55.0, -55.0, 0.0],
+    [58.0, -50.0, 6.0],
+    [52.0, 56.0, 34.0],
+    [-50.0, 54.0, 18.0],
+];
 
 /// Ground truth at an instant.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +120,9 @@ pub struct Tick {
     pub gps: Option<V3>,
     pub baro: Option<f64>,
     pub mag: Option<V3>,
+    pub lidar: Option<f64>,
+    pub uwb: Option<[f64; 4]>,
+    pub flow: Option<[f64; 2]>,
 }
 
 pub struct Simulator {
@@ -96,6 +134,9 @@ pub struct Simulator {
     next_gps: f64,
     next_baro: f64,
     next_mag: f64,
+    next_lidar: f64,
+    next_uwb: f64,
+    next_flow: f64,
 }
 
 impl Simulator {
@@ -110,6 +151,9 @@ impl Simulator {
             next_gps: 0.0,
             next_baro: 0.0,
             next_mag: 0.0,
+            next_lidar: 0.0,
+            next_uwb: 0.0,
+            next_flow: 0.0,
         }
     }
 
@@ -153,37 +197,73 @@ impl Simulator {
             omega[2] + self.gyro_bias[2] + self.rng.gaussian() * self.cfg.gyro_noise,
         ];
 
-        let gps = if !self.cfg.gps_dropout && t >= self.next_gps {
-            self.next_gps += 1.0 / self.cfg.gps_rate;
+        // Each aiding sensor fires on its own schedule when enabled. A disabled sensor still keeps
+        // its clock current, so re-enabling it resumes at the right cadence rather than in a burst.
+        let due = |t: f64, next: &mut f64, rate: f64, enabled: bool| -> bool {
+            if t < *next {
+                return false;
+            }
+            *next += 1.0 / rate;
+            enabled
+        };
+
+        let gps = if due(t, &mut self.next_gps, self.cfg.gps_rate, self.cfg.gps_enabled) {
             Some([
                 s.p[0] + self.rng.gaussian() * self.cfg.gps_noise,
                 s.p[1] + self.rng.gaussian() * self.cfg.gps_noise,
                 s.p[2] + self.rng.gaussian() * self.cfg.gps_noise,
             ])
         } else {
-            if self.cfg.gps_dropout {
-                // Keep the schedule current so service resumes promptly, not in a burst.
-                while t >= self.next_gps {
-                    self.next_gps += 1.0 / self.cfg.gps_rate;
-                }
-            }
             None
         };
 
-        let baro = if t >= self.next_baro {
-            self.next_baro += 1.0 / self.cfg.baro_rate;
+        let baro = if due(t, &mut self.next_baro, self.cfg.baro_rate, self.cfg.baro_enabled) {
             Some(s.p[2] + self.rng.gaussian() * self.cfg.baro_noise)
         } else {
             None
         };
 
-        let mag = if t >= self.next_mag {
-            self.next_mag += 1.0 / self.cfg.mag_rate;
+        let mag = if due(t, &mut self.next_mag, self.cfg.mag_rate, self.cfg.mag_enabled) {
             let b = s.q.rotate_inv(MAG_REFERENCE);
             Some([
                 b[0] + self.rng.gaussian() * self.cfg.mag_noise,
                 b[1] + self.rng.gaussian() * self.cfg.mag_noise,
                 b[2] + self.rng.gaussian() * self.cfg.mag_noise,
+            ])
+        } else {
+            None
+        };
+
+        // Downward LiDAR altimeter: slant range to the ground plane, only when the beam actually
+        // reaches it (not banked past horizontal, above the plane).
+        let lidar = if due(t, &mut self.next_lidar, self.cfg.lidar_rate, self.cfg.lidar_enabled) {
+            let r22 = s.q.to_matrix().m[2][2];
+            if r22 > 0.2 && s.p[2] > 0.0 {
+                Some(s.p[2] / r22 + self.rng.gaussian() * self.cfg.lidar_noise)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // UWB: one range to every beacon per sweep.
+        let uwb = if due(t, &mut self.next_uwb, self.cfg.uwb_rate, self.cfg.uwb_enabled) {
+            let mut r = [0.0; 4];
+            for (i, b) in BEACONS.iter().enumerate() {
+                r[i] = v3::norm(v3::sub(s.p, *b)) + self.rng.gaussian() * self.cfg.uwb_noise;
+            }
+            Some(r)
+        } else {
+            None
+        };
+
+        // Optical flow: body-frame horizontal velocity.
+        let flow = if due(t, &mut self.next_flow, self.cfg.flow_rate, self.cfg.flow_enabled) {
+            let vb = s.q.rotate_inv(s.v);
+            Some([
+                vb[0] + self.rng.gaussian() * self.cfg.flow_noise,
+                vb[1] + self.rng.gaussian() * self.cfg.flow_noise,
             ])
         } else {
             None
@@ -197,7 +277,7 @@ impl Simulator {
             gyro_bias: self.gyro_bias,
         };
         self.t += dt;
-        Tick { t, dt, truth, accel, gyro, gps, baro, mag }
+        Tick { t, dt, truth, accel, gyro, gps, baro, mag, lidar, uwb, flow }
     }
 }
 
@@ -378,7 +458,7 @@ mod tests {
 
     #[test]
     fn gps_dropout_suppresses_fixes() {
-        let cfg = SimConfig { gps_dropout: true, ..Default::default() };
+        let cfg = SimConfig { gps_enabled: false, ..Default::default() };
         let mut sim = Simulator::new(cfg, 1);
         for _ in 0..400 {
             assert!(sim.step().gps.is_none(), "GPS leaked through a dropout");
