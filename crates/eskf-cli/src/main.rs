@@ -9,7 +9,7 @@
 //! dropped covariance-reset term shows up here as an inconsistent filter, even when the RMSE
 //! looks fine.
 
-use eskf::sim::SimConfig;
+use eskf::sim::{SimConfig, BEACONS};
 use eskf::{nees, position_nees, Eskf, InitialSigma, Noise, Simulator, MAG_REFERENCE};
 
 const IMU_RATE: f64 = 200.0;
@@ -66,6 +66,17 @@ fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
         if let Some(z) = tick.mag {
             f.update_mag(z, MAG_REFERENCE, cfg.mag_noise.max(1e-4));
         }
+        if let Some(z) = tick.lidar {
+            f.update_lidar_altimeter(z, cfg.lidar_noise.max(1e-3));
+        }
+        if let Some(ranges) = tick.uwb {
+            for (i, r) in ranges.iter().enumerate() {
+                f.update_range(BEACONS[i], *r, cfg.uwb_noise.max(1e-3));
+            }
+        }
+        if let Some(z) = tick.flow {
+            f.update_optical_flow(z, cfg.flow_noise.max(1e-3));
+        }
 
         if k >= settle {
             let dp = sub(f.nom.p, tick.truth.p);
@@ -111,7 +122,9 @@ fn filter_noise(cfg: &SimConfig) -> Noise {
 fn consistency_check() -> bool {
     let runs = 40;
     let seconds = 30.0;
-    let cfg = SimConfig::default();
+    // Every sensor on, so the check exercises the full fusion — IMU, GPS, baro, mag, LiDAR, UWB
+    // and optical flow — not just a subset.
+    let cfg = SimConfig { uwb_enabled: true, flow_enabled: true, ..SimConfig::default() };
 
     println!("Monte-Carlo consistency check — {runs} flights of {seconds:.0} s, all sensors on\n");
 
@@ -167,9 +180,13 @@ type Scenario = (&'static str, fn(&mut SimConfig));
 
 fn scenarios() {
     let seconds = 30.0;
-    let cases: [Scenario; 4] = [
+    let cases: [Scenario; 5] = [
         ("nominal", |_c| {}),
-        ("GPS dropout", |c| c.gps_dropout = true),
+        ("GPS dropout", |c| c.gps_enabled = false),
+        ("GPS-denied + UWB", |c| {
+            c.gps_enabled = false;
+            c.uwb_enabled = true;
+        }),
         ("noisy IMU (5×)", |c| {
             c.accel_noise *= 5.0;
             c.gyro_noise *= 5.0;
