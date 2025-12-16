@@ -1,24 +1,46 @@
 //! wasm-bindgen surface for the sensor-fusion playground.
 //!
 //! Holds a live [`Simulator`] and [`Eskf`] and advances them together, one browser frame at a
-//! time. The heavy state — the rolling estimated and true trajectories — is exposed as pointers
-//! into linear memory so the renderer reads them without a per-point copy across the boundary;
-//! the small per-frame scalars (pose, the 3×3 position covariance for the ellipsoid, and the
-//! error metrics) come back as one short `Float32Array`.
+//! time. The rolling estimated and true trajectories are exposed as pointers into linear memory so
+//! the renderer reads them without a per-point copy; the small per-frame scalars — pose, the 3×3
+//! position covariance for the ellipsoid, the error metrics, the estimated biases and a decaying
+//! per-sensor activity pulse — come back as one short `Float32Array`.
 //!
 //! The same `eskf` crate that passes the native NEES consistency gate runs here unchanged.
 
+use eskf::sim::BEACONS;
 use eskf::{Eskf, InitialSigma, Noise, SimConfig, Simulator, TrueState, MAG_REFERENCE};
 use wasm_bindgen::prelude::*;
 
 /// Trajectory history: 12 s at 50 Hz.
 const TRAIL_MAX: usize = 600;
 const TRAIL_STRIDE: usize = 4; // push a point every 4 IMU steps (≈50 Hz at 200 Hz IMU)
+const SNAPSHOT_LEN: usize = 48;
+
+// Sensor-pulse indices.
+const S_GPS: usize = 0;
+const S_BARO: usize = 1;
+const S_MAG: usize = 2;
+const S_LIDAR: usize = 3;
+const S_UWB: usize = 4;
+const S_FLOW: usize = 5;
 
 #[wasm_bindgen(start)]
 pub fn start() {
     #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
+}
+
+/// The fixed UWB beacon positions, flattened `[x,y,z, …]`, so the renderer can draw them.
+#[wasm_bindgen]
+pub fn beacon_positions() -> Vec<f32> {
+    let mut out = Vec::with_capacity(BEACONS.len() * 3);
+    for b in BEACONS {
+        out.push(b[0] as f32);
+        out.push(b[1] as f32);
+        out.push(b[2] as f32);
+    }
+    out
 }
 
 #[wasm_bindgen]
@@ -33,10 +55,11 @@ pub struct Session {
     truth_trail: Vec<f32>,
     step_count: usize,
 
-    // Exponential moving averages, so the readouts respond to a slider without a noisy jump.
     ema_pos: f64,
     ema_att: f64,
     ema_nees: f64,
+    inst_pos: f64,
+    pulse: [f32; 6],
 
     snapshot: Vec<f32>,
 }
@@ -61,7 +84,9 @@ impl Session {
             ema_pos: 0.0,
             ema_att: 0.0,
             ema_nees: 3.0,
-            snapshot: vec![0.0; 32],
+            inst_pos: 0.0,
+            pulse: [0.0; 6],
+            snapshot: vec![0.0; SNAPSHOT_LEN],
         }
     }
 
@@ -77,10 +102,12 @@ impl Session {
         self.ema_pos = 0.0;
         self.ema_att = 0.0;
         self.ema_nees = 3.0;
+        self.inst_pos = 0.0;
+        self.pulse = [0.0; 6];
     }
 
-    // --- Slider-driven configuration. The simulator's actual noise and the filter's assumed
-    // noise track together, so the uncertainty ellipsoid always reflects the real uncertainty. ---
+    // --- Sensor noise (the simulator's actual noise; the filter's assumed noise tracks the IMU
+    // terms so the uncertainty ellipsoid always reflects the real uncertainty). ---
 
     pub fn set_accel_noise(&mut self, v: f64) {
         self.cfg.accel_noise = v;
@@ -114,9 +141,44 @@ impl Session {
         self.cfg.mag_noise = v;
         self.sim.cfg.mag_noise = v;
     }
-    pub fn set_gps_dropout(&mut self, dropped: bool) {
-        self.cfg.gps_dropout = dropped;
-        self.sim.cfg.gps_dropout = dropped;
+    pub fn set_lidar_noise(&mut self, v: f64) {
+        self.cfg.lidar_noise = v;
+        self.sim.cfg.lidar_noise = v;
+    }
+    pub fn set_uwb_noise(&mut self, v: f64) {
+        self.cfg.uwb_noise = v;
+        self.sim.cfg.uwb_noise = v;
+    }
+    pub fn set_flow_noise(&mut self, v: f64) {
+        self.cfg.flow_noise = v;
+        self.sim.cfg.flow_noise = v;
+    }
+
+    // --- Per-sensor enables. ---
+
+    pub fn set_gps_enabled(&mut self, on: bool) {
+        self.cfg.gps_enabled = on;
+        self.sim.cfg.gps_enabled = on;
+    }
+    pub fn set_baro_enabled(&mut self, on: bool) {
+        self.cfg.baro_enabled = on;
+        self.sim.cfg.baro_enabled = on;
+    }
+    pub fn set_mag_enabled(&mut self, on: bool) {
+        self.cfg.mag_enabled = on;
+        self.sim.cfg.mag_enabled = on;
+    }
+    pub fn set_lidar_enabled(&mut self, on: bool) {
+        self.cfg.lidar_enabled = on;
+        self.sim.cfg.lidar_enabled = on;
+    }
+    pub fn set_uwb_enabled(&mut self, on: bool) {
+        self.cfg.uwb_enabled = on;
+        self.sim.cfg.uwb_enabled = on;
+    }
+    pub fn set_flow_enabled(&mut self, on: bool) {
+        self.cfg.flow_enabled = on;
+        self.sim.cfg.flow_enabled = on;
     }
 
     /// Advance by `dt` seconds of wall-clock time, running the matching number of IMU steps
@@ -131,24 +193,45 @@ impl Session {
     }
 
     fn advance_one(&mut self) {
+        for p in self.pulse.iter_mut() {
+            *p *= 0.94; // fade the activity indicators
+        }
+
         let tick = self.sim.step();
         self.filter.predict(tick.accel, tick.gyro, tick.dt);
         if let Some(z) = tick.gps {
             self.filter.update_gps(z, self.cfg.gps_noise.max(1e-3));
+            self.pulse[S_GPS] = 1.0;
         }
         if let Some(z) = tick.baro {
             self.filter.update_baro(z, self.cfg.baro_noise.max(1e-3));
+            self.pulse[S_BARO] = 1.0;
         }
         if let Some(z) = tick.mag {
             self.filter.update_mag(z, MAG_REFERENCE, self.cfg.mag_noise.max(1e-4));
+            self.pulse[S_MAG] = 1.0;
+        }
+        if let Some(z) = tick.lidar {
+            self.filter.update_lidar_altimeter(z, self.cfg.lidar_noise.max(1e-3));
+            self.pulse[S_LIDAR] = 1.0;
+        }
+        if let Some(ranges) = tick.uwb {
+            for (i, r) in ranges.iter().enumerate() {
+                self.filter.update_range(BEACONS[i], *r, self.cfg.uwb_noise.max(1e-3));
+            }
+            self.pulse[S_UWB] = 1.0;
+        }
+        if let Some(z) = tick.flow {
+            self.filter.update_optical_flow(z, self.cfg.flow_noise.max(1e-3));
+            self.pulse[S_FLOW] = 1.0;
         }
         self.last_truth = tick.truth;
 
-        // Error metrics (EMA).
         let dp = sub(self.filter.nom.p, tick.truth.p);
         let dth = eskf::quat::boxminus(tick.truth.q, self.filter.nom.q);
         let a = 0.02;
-        self.ema_pos += a * (norm(dp) - self.ema_pos);
+        self.inst_pos = norm(dp);
+        self.ema_pos += a * (self.inst_pos - self.ema_pos);
         self.ema_att += a * (norm(dth).to_degrees() - self.ema_att);
         if let Some(v) = eskf::position_nees(&self.filter.nom, &tick.truth, self.filter.covariance()) {
             self.ema_nees += a * (v - self.ema_nees);
@@ -190,12 +273,19 @@ impl Session {
         s[26] = self.ema_pos as f32;
         s[27] = self.ema_att as f32;
         s[28] = self.ema_nees as f32;
-        s[29] = if self.cfg.gps_dropout { 0.0 } else { 1.0 };
-        s[30] = self.sim.time() as f32;
-        s[31] = norm(n.gyro_bias).to_degrees() as f32; // estimated gyro-bias magnitude, °/s
+        s[29] = self.sim.time() as f32;
+        put3(s, 30, n.accel_bias);
+        put3(s, 33, n.gyro_bias);
+        for (i, p) in self.pulse.iter().enumerate() {
+            s[36 + i] = *p;
+        }
+        // 1σ position uncertainty (RMS of the three axes) — the ellipsoid's scale, for the plot.
+        let trace = cov.m[0][0] + cov.m[1][1] + cov.m[2][2];
+        s[42] = (trace / 3.0).max(0.0).sqrt() as f32;
+        s[43] = self.inst_pos as f32;
     }
 
-    /// The per-frame scalars: est pose, truth pose, 3×3 position covariance, and metrics.
+    /// The per-frame scalars: pose, truth pose, position covariance, metrics, biases, activity.
     pub fn snapshot(&self) -> Vec<f32> {
         self.snapshot.clone()
     }
