@@ -91,6 +91,32 @@ export function quatAxes(q: [number, number, number, number]): { x: Vec3; y: Vec
 }
 
 /**
+ * Model matrix placing a body-frame mesh at world position `p`, oriented by the quaternion `q`,
+ * uniformly scaled by `scale`. Column-major; columns 0-2 are the scaled body axes, column 3 the
+ * translation.
+ */
+export function modelMatrix(
+  p: Vec3,
+  q: [number, number, number, number],
+  scale: number,
+): Mat4 {
+  const ax = quatAxes(q)
+  return new Float32Array([
+    ax.x[0] * scale, ax.x[1] * scale, ax.x[2] * scale, 0,
+    ax.y[0] * scale, ax.y[1] * scale, ax.y[2] * scale, 0,
+    ax.z[0] * scale, ax.z[1] * scale, ax.z[2] * scale, 0,
+    p[0], p[1], p[2], 1,
+  ])
+}
+
+/** The mat3 that carries a model-space normal into world space (the rotation, since scale is
+ * uniform): its columns are the body axes. Column-major. */
+export function normalMatrix(q: [number, number, number, number]): Float32Array {
+  const ax = quatAxes(q)
+  return new Float32Array([ax.x[0], ax.x[1], ax.x[2], ax.y[0], ax.y[1], ax.y[2], ax.z[0], ax.z[1], ax.z[2]])
+}
+
+/**
  * Lower-triangular Cholesky factor of a symmetric 3×3 covariance (row-major in), returned as a
  * column-major `mat3` scaled by `k`. Transforming a unit sphere by `k·L` yields the `k`-σ
  * uncertainty ellipsoid, since `L Lᵀ = P`. Diagonal terms are floored so a momentarily

@@ -4,7 +4,7 @@
 //! hundred hertz, which is nothing, so there is no worker to justify.
 
 import './styles.css'
-import init, { Session } from './wasm/eskf_wasm.js'
+import init, { Session, beacon_positions } from './wasm/eskf_wasm.js'
 import wasmUrl from './wasm/eskf_wasm_bg.wasm?url'
 import { Scene } from './gl/scene.js'
 import { Ui } from './ui.js'
@@ -18,7 +18,7 @@ async function main() {
 
   const session = new Session(BigInt(Date.now()) & 0xffffffffn)
   const ui = new Ui(root, session)
-  const scene = new Scene(ui.canvas)
+  const scene = new Scene(ui.canvas, beacon_positions())
 
   window.addEventListener('resize', () => scene.resize())
 
