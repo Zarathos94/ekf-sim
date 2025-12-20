@@ -1,5 +1,6 @@
-//! The control surface: the 3D stage, the sensor sliders that drive the simulator, and the
-//! error/consistency readouts. Pure DOM, no framework.
+//! The control surface: the 3D stage, the sensor toggles and noise sliders that drive the
+//! simulator, the error/consistency readouts, and a live plot of the position error against its
+//! own 3σ envelope — the consistency claim, made visible. Pure DOM, no framework.
 
 import type { Session } from './wasm/eskf_wasm.js'
 
@@ -14,81 +15,116 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node
 }
 
-interface Readouts {
-  pos: HTMLElement
-  att: HTMLElement
-  nees: HTMLElement
-  neesDot: HTMLElement
-  gps: HTMLElement
-  time: HTMLElement
+interface SensorDef {
+  label: string
+  on: boolean
+  pulse: number
+  color: string
+  set: (s: Session, v: boolean) => void
 }
+
+// Order matches the snapshot's pulse block [36..42].
+const SENSORS: SensorDef[] = [
+  { label: 'GPS', on: true, pulse: 0, color: '#73bfff', set: (s, v) => s.set_gps_enabled(v) },
+  { label: 'Barometer', on: true, pulse: 1, color: '#8ad', set: (s, v) => s.set_baro_enabled(v) },
+  { label: 'Magnetometer', on: true, pulse: 2, color: '#c9a', set: (s, v) => s.set_mag_enabled(v) },
+  { label: 'LiDAR altimeter', on: true, pulse: 3, color: '#ffbe59', set: (s, v) => s.set_lidar_enabled(v) },
+  { label: 'UWB radio ranging', on: false, pulse: 4, color: '#c78bff', set: (s, v) => s.set_uwb_enabled(v) },
+  { label: 'Optical flow', on: false, pulse: 5, color: '#5be68d', set: (s, v) => s.set_flow_enabled(v) },
+]
 
 export class Ui {
   readonly canvas: HTMLCanvasElement
   paused = false
   onReset: () => void = () => {}
 
-  private readonly r: Readouts
+  private readonly rPos: HTMLElement
+  private readonly rAtt: HTMLElement
+  private readonly rNees: HTMLElement
+  private readonly rNeesDot: HTMLElement
+  private readonly rTime: HTMLElement
+  private readonly dots: HTMLElement[] = []
+  private readonly plot: ConsistencyPlot
 
   constructor(root: HTMLElement, session: Session) {
     root.classList.add('eskf-root')
 
+    // --- Stage: the 3D canvas with a floating legend and metric readouts. ---
     const stage = el('div', 'stage')
     this.canvas = el('canvas', 'scene')
     stage.append(this.canvas)
 
-    // Legend + readouts float over the stage.
     const hud = el('div', 'hud')
     hud.append(
       legend('#73bfff', 'Estimate'),
       legend('#5be68d', 'Ground truth'),
       legend('#ffbe59', '95% uncertainty'),
+      legend('#c78bff', 'UWB beacon'),
     )
     stage.append(hud)
 
     const metrics = el('div', 'metrics')
-    const posM = metric('Position error', '—')
-    const attM = metric('Attitude error', '—')
-    const neesM = metric('Position NEES', '—')
-    const gpsM = metric('GPS', '—')
-    const timeM = metric('Flight time', '—')
-    const neesDot = el('span', 'dot')
-    neesM.value.prepend(neesDot)
-    metrics.append(posM.wrap, attM.wrap, neesM.wrap, gpsM.wrap, timeM.wrap)
+    const posM = metric('Position error')
+    const attM = metric('Attitude error')
+    const neesM = metric('Position NEES')
+    const timeM = metric('Flight time')
+    this.rNeesDot = el('span', 'dot')
+    neesM.value.prepend(this.rNeesDot)
+    metrics.append(posM.wrap, attM.wrap, neesM.wrap, timeM.wrap)
     stage.append(metrics)
+    this.rPos = posM.value
+    this.rAtt = attM.value
+    this.rNees = neesM.value
+    this.rTime = timeM.value
 
-    this.r = {
-      pos: posM.value,
-      att: attM.value,
-      nees: neesM.value,
-      neesDot,
-      gps: gpsM.value,
-      time: timeM.value,
-    }
-
-    // Control rail.
+    // --- Rail: title, sensors, noise, consistency plot, run controls. ---
     const rail = el('div', 'rail')
     const title = el('div', 'title')
-    title.append(el('h1', undefined, 'Sensor Fusion Playground'), el('p', undefined, 'Error-state EKF · IMU + GPS + baro + magnetometer'))
+    title.append(
+      el('h1', undefined, 'Sensor Fusion Playground'),
+      el('p', undefined, 'Error-state EKF · IMU + GPS + baro + mag + LiDAR + UWB + flow'),
+    )
     rail.append(title)
 
-    rail.append(sectionLabel('Sensors — turn up the noise'))
+    rail.append(sectionLabel('Sensors — toggle to see what each one buys'))
+    for (const def of SENSORS) {
+      def.set(session, def.on)
+      const row = el('label', 'sensor')
+      const input = el('input')
+      input.type = 'checkbox'
+      input.checked = def.on
+      input.addEventListener('change', () => def.set(session, input.checked))
+      const dot = el('span', 'sdot')
+      dot.style.background = def.color
+      dot.style.opacity = '0.15'
+      this.dots.push(dot)
+      row.append(input, el('span', 'sname', def.label), dot)
+      rail.append(row)
+    }
+
+    rail.append(sectionLabel('IMU noise & bias drift'))
     rail.append(
       slider('Accel noise', 0.0, 1.0, 0.06, 0.005, 'm/s²', (v) => session.set_accel_noise(v)),
       slider('Gyro noise', 0.0, 0.08, 0.004, 0.001, 'rad/s', (v) => session.set_gyro_noise(v)),
       slider('Accel bias drift', 0.0, 0.03, 0.002, 0.0005, 'm/s²/√s', (v) => session.set_accel_bias_walk(v)),
       slider('Gyro bias drift', 0.0, 0.004, 0.0002, 0.0001, 'rad/s/√s', (v) => session.set_gyro_bias_walk(v)),
-      slider('GPS noise', 0.1, 8.0, 0.8, 0.1, 'm', (v) => session.set_gps_noise(v)),
-      slider('Baro noise', 0.1, 6.0, 0.6, 0.1, 'm', (v) => session.set_baro_noise(v)),
-      slider('Mag noise', 0.0, 0.2, 0.02, 0.005, '', (v) => session.set_mag_noise(v)),
     )
 
-    rail.append(sectionLabel('Failures'))
-    const gpsToggle = toggle('GPS dropout', (on) => session.set_gps_dropout(on))
-    rail.append(gpsToggle)
+    rail.append(sectionLabel('Aiding-sensor noise'))
+    rail.append(
+      slider('GPS noise', 0.1, 8.0, 0.8, 0.1, 'm', (v) => session.set_gps_noise(v)),
+      slider('LiDAR noise', 0.02, 2.0, 0.15, 0.02, 'm', (v) => session.set_lidar_noise(v)),
+      slider('UWB noise', 0.05, 3.0, 0.35, 0.05, 'm', (v) => session.set_uwb_noise(v)),
+      slider('Optical-flow noise', 0.02, 1.0, 0.15, 0.02, 'm/s', (v) => session.set_flow_noise(v)),
+    )
+
+    rail.append(sectionLabel('Consistency — error vs 3σ'))
+    this.plot = new ConsistencyPlot()
+    rail.append(this.plot.canvas)
+    rail.append(el('p', 'plotcap', 'The error (white) should stay inside the ±3σ envelope (orange) the filter reports.'))
 
     rail.append(sectionLabel('Run'))
-    const controls = el('div', 'buttons')
+    const buttons = el('div', 'buttons')
     const pauseBtn = el('button', 'btn', 'Pause')
     pauseBtn.addEventListener('click', () => {
       this.paused = !this.paused
@@ -98,16 +134,17 @@ export class Ui {
     const resetBtn = el('button', 'btn', 'New flight')
     resetBtn.addEventListener('click', () => {
       session.reset()
+      this.plot.clear()
       this.onReset()
     })
-    controls.append(pauseBtn, resetBtn)
-    rail.append(controls)
+    buttons.append(pauseBtn, resetBtn)
+    rail.append(buttons)
 
     rail.append(
       el(
         'p',
         'hint',
-        'Drag to orbit, scroll to zoom. Watch the ellipsoid swell when GPS drops — the filter still knows where it is, and how unsure it has become.',
+        'Drag to orbit, scroll to zoom. Turn GPS off and the ellipsoid balloons — then turn on UWB ranging and watch it snap back. The quadrotor shows the estimated attitude; the faint one is ground truth.',
       ),
     )
 
@@ -118,13 +155,13 @@ export class Ui {
     const posErr = s[26]!
     const attErr = s[27]!
     const nees = s[28]!
-    const gpsLock = s[29]! > 0.5
-    const t = s[30]!
+    const t = s[29]!
+    const sigma3 = 3 * s[42]!
+    const instErr = s[43]!
 
-    this.r.pos.lastChild!.textContent = `${posErr.toFixed(2)} m`
-    this.r.att.textContent = `${attErr.toFixed(2)}°`
-    // NEES ≈ 3 is consistent; well above means overconfident, well below conservative.
-    this.r.nees.lastChild!.textContent = ` ${nees.toFixed(2)}`
+    this.rPos.lastChild!.textContent = `${posErr.toFixed(2)} m`
+    this.rAtt.textContent = `${attErr.toFixed(2)}°`
+    this.rNees.lastChild!.textContent = ` ${nees.toFixed(2)}`
     let cls = 'dot ok'
     let hint = 'consistent'
     if (nees > 6.0) {
@@ -134,11 +171,95 @@ export class Ui {
       cls = 'dot warn'
       hint = 'conservative'
     }
-    this.r.neesDot.className = cls
-    this.r.neesDot.title = hint
-    this.r.gps.textContent = gpsLock ? 'locked' : 'DROPOUT'
-    this.r.gps.classList.toggle('alert', !gpsLock)
-    this.r.time.textContent = `${t.toFixed(1)} s`
+    this.rNeesDot.className = cls
+    this.rNeesDot.title = hint
+    this.rTime.textContent = `${t.toFixed(1)} s`
+
+    // Sensor activity dots, driven by the decaying pulses.
+    for (let i = 0; i < this.dots.length; i++) {
+      const p = s[36 + i]!
+      this.dots[i]!.style.opacity = (0.15 + 0.85 * p).toFixed(2)
+    }
+
+    if (!this.paused) this.plot.push(instErr, sigma3)
+    this.plot.draw()
+  }
+}
+
+/** A scrolling plot of the position error against its 3σ envelope. */
+class ConsistencyPlot {
+  readonly canvas: HTMLCanvasElement
+  private readonly ctx: CanvasRenderingContext2D
+  private readonly err: number[] = []
+  private readonly sig: number[] = []
+  private readonly max = 200
+
+  constructor() {
+    this.canvas = el('canvas', 'plot')
+    const ctx = this.canvas.getContext('2d')
+    if (!ctx) throw new Error('2D canvas unavailable')
+    this.ctx = ctx
+  }
+
+  clear() {
+    this.err.length = 0
+    this.sig.length = 0
+  }
+
+  push(err: number, sigma3: number) {
+    this.err.push(err)
+    this.sig.push(sigma3)
+    if (this.err.length > this.max) {
+      this.err.shift()
+      this.sig.shift()
+    }
+  }
+
+  draw() {
+    const ctx = this.ctx
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const w = this.canvas.clientWidth || 264
+    const h = 96
+    if (this.canvas.width !== Math.round(w * dpr)) {
+      this.canvas.width = Math.round(w * dpr)
+      this.canvas.height = Math.round(h * dpr)
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, w, h)
+    ctx.fillStyle = '#0d1320'
+    ctx.fillRect(0, 0, w, h)
+
+    const n = this.err.length
+    if (n < 2) return
+    let top = 0.5
+    for (let i = 0; i < n; i++) top = Math.max(top, this.sig[i]!, this.err[i]!)
+    top *= 1.15
+    const x = (i: number) => (i / (this.max - 1)) * w
+    const y = (v: number) => h - (v / top) * (h - 6) - 3
+
+    // 3σ envelope (filled).
+    ctx.beginPath()
+    ctx.moveTo(x(0), y(this.sig[0]!))
+    for (let i = 1; i < n; i++) ctx.lineTo(x(i), y(this.sig[i]!))
+    ctx.lineTo(x(n - 1), h)
+    ctx.lineTo(x(0), h)
+    ctx.closePath()
+    ctx.fillStyle = 'rgba(255,190,89,0.16)'
+    ctx.fill()
+    ctx.strokeStyle = 'rgba(255,190,89,0.85)'
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(x(0), y(this.sig[0]!))
+    for (let i = 1; i < n; i++) ctx.lineTo(x(i), y(this.sig[i]!))
+    ctx.stroke()
+
+    // Error line.
+    ctx.strokeStyle = 'rgba(235,240,250,0.95)'
+    ctx.lineWidth = 1.25
+    ctx.beginPath()
+    ctx.moveTo(x(0), y(this.err[0]!))
+    for (let i = 1; i < n; i++) ctx.lineTo(x(i), y(this.err[i]!))
+    ctx.stroke()
   }
 }
 
@@ -150,11 +271,11 @@ function legend(color: string, label: string): HTMLElement {
   return wrap
 }
 
-function metric(label: string, value: string): { wrap: HTMLElement; value: HTMLElement } {
+function metric(label: string): { wrap: HTMLElement; value: HTMLElement } {
   const wrap = el('div', 'metric')
   wrap.append(el('span', 'k', label))
   const v = el('span', 'v')
-  v.append(document.createTextNode(value))
+  v.append(document.createTextNode('—'))
   wrap.append(v)
   return { wrap, value: v }
 }
@@ -189,15 +310,6 @@ function slider(
     onInput(v)
   })
   wrap.append(head, input)
-  return wrap
-}
-
-function toggle(label: string, onChange: (on: boolean) => void): HTMLElement {
-  const wrap = el('label', 'toggle')
-  const input = el('input')
-  input.type = 'checkbox'
-  input.addEventListener('change', () => onChange(input.checked))
-  wrap.append(input, el('span', undefined, label))
   return wrap
 }
 
