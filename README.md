@@ -1,10 +1,13 @@
 # ekf-sim — a quaternion error-state EKF, proven consistent
 
 A sensor-fusion playground: an **error-state Kalman filter** (ESKF) fuses a simulated strapdown
-IMU with GPS, a barometer and a magnetometer to estimate a vehicle's trajectory, and renders the
-estimate, the ground truth and the live **covariance ellipsoid** in 3D. Turn up the sensor noise,
-the bias drift, or drop GPS, and watch the filter degrade and recover — the uncertainty ellipsoid
-swelling and shrinking in real units as it does.
+IMU with GPS, a barometer, a magnetometer, a downward **LiDAR** altimeter, **UWB radio ranging**
+to fixed beacons, and **optical flow** to estimate a quadrotor's trajectory. The estimate, the
+ground truth (as a lit quadrotor and a faint ghost) and the live **covariance ellipsoid** are
+rendered in 3D. Toggle any sensor, turn up the noise or the bias drift, and watch the filter
+degrade and recover — the uncertainty ellipsoid swelling and shrinking in real units, and a live
+plot showing the error stay inside its own 3σ envelope. Drop GPS and the ellipsoid balloons; turn
+on UWB ranging and it snaps back, localised with no GPS at all.
 
 The point of the project is that the quaternion ESKF is done *right*, and that this is **proven,
 not asserted**. The gate is statistical consistency: across many Monte-Carlo flights the filter's
@@ -17,10 +20,10 @@ $ cargo run -p eskf-cli -- check
 
 Monte-Carlo consistency check — 40 flights of 30 s, all sensors on
 
-  RMSE   position 0.431 m   velocity 0.218 m/s   attitude 0.860°
+  RMSE   position 0.083 m   velocity 0.043 m/s   attitude 0.230°
 
-  position    NEES mean  2.704   expected 3   95% band [2.289, 3.805]   ok
-  full state  NEES mean 14.794   expected 15   95% band [13.350, 16.744]   ok
+  position    NEES mean  2.898   expected 3   95% band [2.289, 3.805]   ok
+  full state  NEES mean 16.514   expected 15   95% band [13.350, 16.744]   ok
 
 CONSISTENT — the filter's covariance matches its error. Gate PASSED.
 ```
@@ -37,9 +40,19 @@ error-state Kalman filter* (2017), with the local (body-frame) angular error.
   of an over-parameterised quaternion.
 - **Prediction** propagates the error covariance through the block-structured transition; the
   orientation block uses the exact `exp(−[ω]×dt)`.
-- **Updates**: GPS (3-D position), barometer (altitude), magnetometer (the full field vector in
-  the body frame — heading done as a vector measurement, not a yaw shortcut). Joseph-form
-  covariance update, and the orientation covariance-reset Jacobian on injection.
+- **Updates**, each with its exact error-state Jacobian (finite-difference-checked):
+  - **GPS** — 3-D position.
+  - **Barometer** — altitude.
+  - **Magnetometer** — the full field vector in the body frame (heading as a vector measurement,
+    not a yaw shortcut).
+  - **LiDAR altimeter** — the slant range down to flat ground, `p_z / R₂₂`, so it senses both
+    height and tilt.
+  - **UWB radio ranging** — scalar range to each of four fixed beacons; position-only, so it
+    localises the vehicle with no GPS at all.
+  - **Optical flow** — the body-frame horizontal velocity, observing velocity and attitude.
+
+  Joseph-form covariance update throughout, with the orientation covariance-reset Jacobian on
+  injection.
 
 See [`docs/eskf.md`](docs/eskf.md) for the equations, worked and cited.
 
@@ -48,7 +61,7 @@ See [`docs/eskf.md`](docs/eskf.md) for the equations, worked and cited.
 ```
 crates/
   eskf/       the filter, the quaternion algebra, the simulator, and the NEES metric — no deps,
-              #![forbid(unsafe_code)], 20 native tests
+              #![forbid(unsafe_code)], 24 native tests
   eskf-cli/   the correctness gate: `check` (Monte-Carlo NEES) and `scenarios` (RMSE by failure)
   eskf-wasm/  wasm-bindgen surface: steps sim + filter live for the browser
 web/          Vite + TypeScript, a hand-written WebGL2 scene (no framework)

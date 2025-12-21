@@ -79,6 +79,18 @@ positive-definite under finite precision.
 - **Magnetometer** — `h = Rᵀ m_ref`, the world reference field measured in the body frame. Its
   Jacobian is `∂(Rᵀ m)/∂δθ = [Rᵀ m]×`, giving heading observability from the full vector, not a
   yaw pseudo-measurement.
+- **LiDAR altimeter** — `h = p_z / R₂₂`, the slant range down the body axis to flat ground. Both
+  `∂h/∂p_z = 1/R₂₂` and `∂h/∂δθ = −(p_z/R₂₂²)·[−R₂₁, R₂₀, 0]` are non-zero, so a single downward
+  beam senses height *and* tilt.
+- **UWB radio ranging** — `h = ‖p − bₖ‖` to a fixed beacon `bₖ`, `H = ûᵀ` on `δp`, where `û` is the
+  unit line of sight. Position-only, so a few beacons localise the vehicle with GPS gone.
+- **Optical flow** — `h = (Rᵀ v)_{xy}`, the body-frame horizontal velocity, with `∂h/∂δv` the top
+  two rows of `Rᵀ` and `∂h/∂δθ = [Rᵀ v]×`. It observes velocity and attitude, so the estimate does
+  not drift when position aiding is lost.
+
+Each new Jacobian is checked against a central finite difference of its measurement function in
+the crate's tests, and then — the real proof — the whole seven-sensor fusion is run through the
+NEES gate, which stays consistent only if every Jacobian and noise model is right.
 
 ## Injection and reset
 
