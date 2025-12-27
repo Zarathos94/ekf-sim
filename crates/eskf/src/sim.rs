@@ -8,7 +8,7 @@
 //! dropout are knobs — the point of the playground is to turn them and watch the filter degrade
 //! and recover.
 
-use crate::filter::Nominal;
+use crate::filter::{InitialSigma, Nominal};
 use crate::linalg::{v3, V3};
 use crate::quat::{boxminus, Quat};
 
@@ -83,7 +83,7 @@ impl Default for SimConfig {
             gps_enabled: true,
             baro_enabled: true,
             mag_enabled: true,
-            lidar_enabled: true,
+            lidar_enabled: false,
             uwb_enabled: false,
             flow_enabled: false,
         }
@@ -165,6 +165,32 @@ impl Simulator {
     pub fn truth_nominal(&self) -> Nominal {
         let s = truth_at(0.0);
         Nominal { p: s.p, v: s.v, q: s.q, accel_bias: [0.0; 3], gyro_bias: [0.0; 3] }
+    }
+
+    /// A realistic filter seed: the true initial state perturbed by a draw consistent with the
+    /// initial covariance `sigma`, so the filter starts with a genuine error to converge from
+    /// rather than omnisciently at truth. Biases start at zero — the filter has no prior on them,
+    /// and their initial error (the true bias) is what the initial bias covariance is there to
+    /// cover. Consistent with the NEES gate: `truth − nominal ~ N(0, sigma²)` at t = 0.
+    pub fn sample_initial_nominal(&mut self, sigma: InitialSigma) -> Nominal {
+        let s = truth_at(0.0);
+        let mut draw = |sd: f64| {
+            [
+                self.rng.gaussian() * sd,
+                self.rng.gaussian() * sd,
+                self.rng.gaussian() * sd,
+            ]
+        };
+        let dp = draw(sigma.position);
+        let dv = draw(sigma.velocity);
+        let dth = draw(sigma.orientation);
+        Nominal {
+            p: v3::add(s.p, dp),
+            v: v3::add(s.v, dv),
+            q: s.q.mul(Quat::from_rotation_vector(dth)).normalized(),
+            accel_bias: [0.0; 3],
+            gyro_bias: [0.0; 3],
+        }
     }
 
     /// Advance one IMU period and emit the samples.

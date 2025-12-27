@@ -69,8 +69,8 @@ impl Session {
     #[wasm_bindgen(constructor)]
     pub fn new(seed: u64) -> Session {
         let cfg = SimConfig::default();
-        let sim = Simulator::new(cfg, seed);
-        let filter = build_filter(&sim, &cfg);
+        let mut sim = Simulator::new(cfg, seed);
+        let filter = build_filter(&mut sim, &cfg);
         let last_truth = initial_truth(&sim);
         Session {
             cfg,
@@ -94,7 +94,7 @@ impl Session {
     pub fn reset(&mut self) {
         self.seed = self.seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         self.sim = Simulator::new(self.cfg, self.seed);
-        self.filter = build_filter(&self.sim, &self.cfg);
+        self.filter = build_filter(&mut self.sim, &self.cfg);
         self.last_truth = initial_truth(&self.sim);
         self.est_trail.clear();
         self.truth_trail.clear();
@@ -304,7 +304,7 @@ impl Session {
     }
 }
 
-fn build_filter(sim: &Simulator, cfg: &SimConfig) -> Eskf {
+fn build_filter(sim: &mut Simulator, cfg: &SimConfig) -> Eskf {
     let noise = Noise {
         gravity: eskf::GRAVITY,
         accel: cfg.accel_noise,
@@ -312,7 +312,9 @@ fn build_filter(sim: &Simulator, cfg: &SimConfig) -> Eskf {
         accel_bias: cfg.accel_bias_walk,
         gyro_bias: cfg.gyro_bias_walk,
     };
-    Eskf::new(sim.truth_nominal(), InitialSigma::default(), noise)
+    // Start with a real initial error to converge from, not omnisciently at truth.
+    let seed_nom = sim.sample_initial_nominal(InitialSigma::default());
+    Eskf::new(seed_nom, InitialSigma::default(), noise)
 }
 
 fn initial_truth(sim: &Simulator) -> TrueState {

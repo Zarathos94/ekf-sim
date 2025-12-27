@@ -44,7 +44,8 @@ struct RunResult {
 
 fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
     let mut sim = Simulator::new(cfg, seed);
-    let mut f = Eskf::new(sim.truth_nominal(), InitialSigma::default(), filter_noise(&cfg));
+    let seed_nom = sim.sample_initial_nominal(InitialSigma::default());
+    let mut f = Eskf::new(seed_nom, InitialSigma::default(), filter_noise(&cfg));
 
     let steps = (seconds * IMU_RATE) as usize;
     let settle = (5.0 * IMU_RATE) as usize; // ignore the first 5 s of convergence
@@ -124,7 +125,12 @@ fn consistency_check() -> bool {
     let seconds = 30.0;
     // Every sensor on, so the check exercises the full fusion — IMU, GPS, baro, mag, LiDAR, UWB
     // and optical flow — not just a subset.
-    let cfg = SimConfig { uwb_enabled: true, flow_enabled: true, ..SimConfig::default() };
+    let cfg = SimConfig {
+        lidar_enabled: true,
+        uwb_enabled: true,
+        flow_enabled: true,
+        ..SimConfig::default()
+    };
 
     println!("Monte-Carlo consistency check — {runs} flights of {seconds:.0} s, all sensors on\n");
 
@@ -180,8 +186,14 @@ type Scenario = (&'static str, fn(&mut SimConfig));
 
 fn scenarios() {
     let seconds = 30.0;
-    let cases: [Scenario; 5] = [
+    let cases: [Scenario; 6] = [
         ("nominal", |_c| {}),
+        ("IMU only (dead-reckon)", |c| {
+            c.gps_enabled = false;
+            c.baro_enabled = false;
+            c.mag_enabled = false;
+            c.lidar_enabled = false;
+        }),
         ("GPS dropout", |c| c.gps_enabled = false),
         ("GPS-denied + UWB", |c| {
             c.gps_enabled = false;
