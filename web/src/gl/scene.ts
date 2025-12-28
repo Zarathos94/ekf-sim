@@ -137,6 +137,16 @@ export class Scene {
   private lastX = 0
   private lastY = 0
 
+  // Display-only magnification of the estimate's offset from truth, so sub-metre errors are
+  // visible on a 40 m orbit. The estimated pose, its trail and the covariance ellipsoid are all
+  // scaled about the true position by the same factor, so the picture stays self-consistent.
+  private exag = 4
+  private dispEst = new Float32Array(0)
+
+  setExaggeration(n: number) {
+    this.exag = Math.max(1, n)
+  }
+
   constructor(private readonly canvas: HTMLCanvasElement, beacons: Float32Array) {
     const gl = canvas.getContext('webgl2', { antialias: true, alpha: false })
     if (!gl) throw new Error('WebGL2 is unavailable in this browser.')
@@ -238,17 +248,37 @@ export class Scene {
     const truthP: Vec3 = [s[10]!, s[11]!, s[12]!]
     const truthQ: [number, number, number, number] = [s[13]!, s[14]!, s[15]!, s[16]!]
 
-    // Trails.
+    // Displayed estimate = truth + exag·(est − truth), so a sub-metre error is visible on a 40 m
+    // orbit. The estimate pose, its trail and the ellipsoid are all magnified about the true
+    // position by the same factor, so the picture stays self-consistent.
+    const e = this.exag
+    const dispEstP: Vec3 = [
+      truthP[0] + e * (estP[0] - truthP[0]),
+      truthP[1] + e * (estP[1] - truthP[1]),
+      truthP[2] + e * (estP[2] - truthP[2]),
+    ]
+
+    // Trails — truth as flown, and the magnified estimate (index-aligned with the truth trail,
+    // since the two are pushed in lockstep).
     upload(gl, this.truthBuf, frame.truthTrail)
     this.drawLines(this.truthBuf.vao, frame.truthTrail.length / 3, vp, [0.35, 0.9, 0.55, 0.95], gl.LINE_STRIP)
-    upload(gl, this.estBuf, frame.estTrail)
-    this.drawLines(this.estBuf.vao, frame.estTrail.length / 3, vp, [0.45, 0.75, 1.0, 0.95], gl.LINE_STRIP)
+    const nTrail = Math.min(frame.estTrail.length, frame.truthTrail.length)
+    if (this.dispEst.length < nTrail) this.dispEst = new Float32Array(nTrail)
+    for (let i = 0; i < nTrail; i++) {
+      this.dispEst[i] = frame.truthTrail[i]! + e * (frame.estTrail[i]! - frame.truthTrail[i]!)
+    }
+    upload(gl, this.estBuf, this.dispEst.subarray(0, nTrail))
+    this.drawLines(this.estBuf.vao, nTrail / 3, vp, [0.45, 0.75, 1.0, 0.95], gl.LINE_STRIP)
 
-    // UWB range lines (when ranging) and the LiDAR down-beam.
+    // The error connector: truth → (magnified) estimate, so drift reads as a growing spear.
+    upload(gl, this.rayBuf, new Float32Array([truthP[0], truthP[1], truthP[2], dispEstP[0], dispEstP[1], dispEstP[2]]))
+    this.drawLines(this.rayBuf.vao, 2, vp, [1.0, 0.35, 0.4, 0.9], gl.LINES)
+
+    // UWB range lines (when ranging) and the LiDAR down-beam, from the drawn vehicle.
     const uwbPulse = s[P_UWB]!
     if (uwbPulse > 0.05) {
       const segs: number[] = []
-      for (const b of this.beacons) segs.push(estP[0], estP[1], estP[2], b[0], b[1], b[2])
+      for (const b of this.beacons) segs.push(dispEstP[0], dispEstP[1], dispEstP[2], b[0], b[1], b[2])
       upload(gl, this.rayBuf, new Float32Array(segs))
       this.drawLines(this.rayBuf.vao, segs.length / 3, vp, [0.78, 0.5, 1.0, 0.35 + 0.4 * uwbPulse], gl.LINES)
     }
@@ -256,22 +286,23 @@ export class Scene {
     if (lidarPulse > 0.05) {
       const ax = normalMatrix(estQ) // columns are body axes; body z is columns[2]
       const upZ: Vec3 = [ax[6]!, ax[7]!, ax[8]!]
-      if (upZ[2] > 0.05 && estP[2] > 0) {
-        const t = estP[2] / upZ[2]
-        const hit: Vec3 = [estP[0] - upZ[0] * t, estP[1] - upZ[1] * t, estP[2] - upZ[2] * t]
-        upload(gl, this.rayBuf, new Float32Array([estP[0], estP[1], estP[2], hit[0], hit[1], hit[2]]))
+      if (upZ[2] > 0.05 && dispEstP[2] > 0) {
+        const t = dispEstP[2] / upZ[2]
+        const hit: Vec3 = [dispEstP[0] - upZ[0] * t, dispEstP[1] - upZ[1] * t, dispEstP[2] - upZ[2] * t]
+        upload(gl, this.rayBuf, new Float32Array([dispEstP[0], dispEstP[1], dispEstP[2], hit[0], hit[1], hit[2]]))
         this.drawLines(this.rayBuf.vao, 2, vp, [1.0, 0.7, 0.3, 0.3 + 0.4 * lidarPulse], gl.LINES)
       }
     }
 
-    // The ghost (truth) quadrotor, then the estimate, then the ellipsoid.
+    // The ghost (truth) quadrotor, then the estimate at the magnified offset, then the ellipsoid.
     gl.depthMask(false)
     this.drawDrone(vp, truthP, truthQ, [0.4, 0.95, 0.55], [0.5, 0.8, 0.6], 0.4)
     gl.depthMask(true)
-    this.drawDrone(vp, estP, estQ, [0.5, 0.72, 1.0], [0.75, 0.85, 1.0], 1.0)
+    this.drawDrone(vp, dispEstP, estQ, [0.5, 0.72, 1.0], [0.75, 0.85, 1.0], 1.0)
 
     const kL = ellipsoidTransform(s.subarray(17, 26), ELLIPSOID_K)
-    this.drawEllipsoid(vp, estP, kL)
+    if (e !== 1) for (let i = 0; i < 9; i++) kL[i] *= e
+    this.drawEllipsoid(vp, dispEstP, kL)
   }
 
   private drawDrone(vp: Mat4, p: Vec3, q: [number, number, number, number], body: number[], rotor: number[], alpha: number) {

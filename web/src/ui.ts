@@ -28,7 +28,7 @@ const SENSORS: SensorDef[] = [
   { label: 'GPS', on: true, pulse: 0, color: '#73bfff', set: (s, v) => s.set_gps_enabled(v) },
   { label: 'Barometer', on: true, pulse: 1, color: '#8ad', set: (s, v) => s.set_baro_enabled(v) },
   { label: 'Magnetometer', on: true, pulse: 2, color: '#c9a', set: (s, v) => s.set_mag_enabled(v) },
-  { label: 'LiDAR altimeter', on: true, pulse: 3, color: '#ffbe59', set: (s, v) => s.set_lidar_enabled(v) },
+  { label: 'LiDAR altimeter', on: false, pulse: 3, color: '#ffbe59', set: (s, v) => s.set_lidar_enabled(v) },
   { label: 'UWB radio ranging', on: false, pulse: 4, color: '#c78bff', set: (s, v) => s.set_uwb_enabled(v) },
   { label: 'Optical flow', on: false, pulse: 5, color: '#5be68d', set: (s, v) => s.set_flow_enabled(v) },
 ]
@@ -37,6 +37,7 @@ export class Ui {
   readonly canvas: HTMLCanvasElement
   paused = false
   onReset: () => void = () => {}
+  onExaggerate: (n: number) => void = () => {}
 
   private readonly rPos: HTMLElement
   private readonly rAtt: HTMLElement
@@ -58,6 +59,7 @@ export class Ui {
     hud.append(
       legend('#73bfff', 'Estimate'),
       legend('#5be68d', 'Ground truth'),
+      legend('#ff5a66', 'Position error'),
       legend('#ffbe59', '95% uncertainty'),
       legend('#c78bff', 'UWB beacon'),
     )
@@ -85,6 +87,11 @@ export class Ui {
       el('p', undefined, 'Error-state EKF · IMU + GPS + baro + mag + LiDAR + UWB + flow'),
     )
     rail.append(title)
+
+    rail.append(sectionLabel('Display'))
+    rail.append(
+      slider('Error exaggeration', 1, 20, 4, 1, '×', (v) => this.onExaggerate(v)),
+    )
 
     rail.append(sectionLabel('Sensors — toggle to see what each one buys'))
     for (const def of SENSORS) {
@@ -144,7 +151,7 @@ export class Ui {
       el(
         'p',
         'hint',
-        'Drag to orbit, scroll to zoom. Turn GPS off and the ellipsoid balloons — then turn on UWB ranging and watch it snap back. The quadrotor shows the estimated attitude; the faint one is ground truth.',
+        "Drag to orbit, scroll to zoom. The red spear is the position error, exaggerated ×4 by default — set it to ×1 for true scale. Turn every aiding sensor off to watch the estimate dead-reckon and drift away; turn GPS off and UWB on to stay localised with no GPS.",
       ),
     )
 

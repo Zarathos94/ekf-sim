@@ -19,6 +19,7 @@ async function main() {
   const session = new Session(BigInt(Date.now()) & 0xffffffffn)
   const ui = new Ui(root, session)
   const scene = new Scene(ui.canvas, beacon_positions())
+  ui.onExaggerate = (n) => scene.setExaggeration(n)
 
   window.addEventListener('resize', () => scene.resize())
 
