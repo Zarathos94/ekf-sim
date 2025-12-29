@@ -31,6 +31,24 @@ uniform vec4 uColor;
 out vec4 frag;
 void main() { frag = uColor; }`
 
+// Trajectory trail: fade the older end (low gl_VertexID) so a long history stays legible.
+const TRAIL_VERT = `#version 300 es
+in vec3 aPos;
+uniform mat4 uMVP;
+uniform float uCount;
+out float vAge;
+void main() {
+  vAge = float(gl_VertexID) / max(uCount - 1.0, 1.0);
+  gl_Position = uMVP * vec4(aPos, 1.0);
+}`
+
+const TRAIL_FRAG = `#version 300 es
+precision highp float;
+in float vAge;
+uniform vec4 uColor;
+out vec4 frag;
+void main() { frag = vec4(uColor.rgb, uColor.a * (0.08 + 0.92 * vAge)); }`
+
 const POINT_VERT = `#version 300 es
 in vec3 aPos;
 uniform mat4 uMVP;
@@ -113,6 +131,7 @@ const P_UWB = 36 + 4
 export class Scene {
   private readonly gl: WebGL2RenderingContext
   private readonly line: Prog
+  private readonly trail: Prog
   private readonly point: Prog
   private readonly lit: Prog
   private readonly ell: Prog
@@ -153,6 +172,7 @@ export class Scene {
     this.gl = gl
 
     this.line = makeProg(gl, LINE_VERT, LINE_FRAG, ['uMVP', 'uColor'])
+    this.trail = makeProg(gl, TRAIL_VERT, TRAIL_FRAG, ['uMVP', 'uColor', 'uCount'])
     this.point = makeProg(gl, POINT_VERT, POINT_FRAG, ['uMVP', 'uColor', 'uSize'])
     this.lit = makeProg(gl, LIT_VERT, LIT_FRAG, ['uMVP', 'uNormal', 'uColor', 'uLight'])
     this.ell = makeProg(gl, ELL_VERT, ELL_FRAG, ['uMVP', 'uColor', 'uL', 'uCenter'])
@@ -261,14 +281,14 @@ export class Scene {
     // Trails — truth as flown, and the magnified estimate (index-aligned with the truth trail,
     // since the two are pushed in lockstep).
     upload(gl, this.truthBuf, frame.truthTrail)
-    this.drawLines(this.truthBuf.vao, frame.truthTrail.length / 3, vp, [0.35, 0.9, 0.55, 0.95], gl.LINE_STRIP)
+    this.drawTrail(this.truthBuf.vao, frame.truthTrail.length / 3, vp, [0.35, 0.9, 0.55, 0.95])
     const nTrail = Math.min(frame.estTrail.length, frame.truthTrail.length)
     if (this.dispEst.length < nTrail) this.dispEst = new Float32Array(nTrail)
     for (let i = 0; i < nTrail; i++) {
       this.dispEst[i] = frame.truthTrail[i]! + e * (frame.estTrail[i]! - frame.truthTrail[i]!)
     }
     upload(gl, this.estBuf, this.dispEst.subarray(0, nTrail))
-    this.drawLines(this.estBuf.vao, nTrail / 3, vp, [0.45, 0.75, 1.0, 0.95], gl.LINE_STRIP)
+    this.drawTrail(this.estBuf.vao, nTrail / 3, vp, [0.45, 0.75, 1.0, 0.95])
 
     // The error connector: truth → (magnified) estimate, so drift reads as a growing spear.
     upload(gl, this.rayBuf, new Float32Array([truthP[0], truthP[1], truthP[2], dispEstP[0], dispEstP[1], dispEstP[2]]))
@@ -331,6 +351,18 @@ export class Scene {
     gl.uniform4fv(this.line.u.uColor!, color)
     gl.bindVertexArray(vao)
     gl.drawArrays(mode, 0, count)
+    gl.bindVertexArray(null)
+  }
+
+  private drawTrail(vao: WebGLVertexArrayObject, count: number, mvp: Mat4, color: number[]) {
+    if (count <= 1) return
+    const gl = this.gl
+    gl.useProgram(this.trail.program)
+    gl.uniformMatrix4fv(this.trail.u.uMVP!, false, mvp)
+    gl.uniform4fv(this.trail.u.uColor!, color)
+    gl.uniform1f(this.trail.u.uCount!, count)
+    gl.bindVertexArray(vao)
+    gl.drawArrays(gl.LINE_STRIP, 0, count)
     gl.bindVertexArray(null)
   }
 

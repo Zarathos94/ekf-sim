@@ -12,8 +12,9 @@ use eskf::sim::BEACONS;
 use eskf::{Eskf, InitialSigma, Noise, SimConfig, Simulator, TrueState, MAG_REFERENCE};
 use wasm_bindgen::prelude::*;
 
-/// Trajectory history: 12 s at 50 Hz.
-const TRAIL_MAX: usize = 600;
+/// Trajectory history: 60 s at 50 Hz — two full orbits, so the divergence between the estimated
+/// and true paths persists on screen. The renderer fades the older end so it stays legible.
+const TRAIL_MAX: usize = 3000;
 const TRAIL_STRIDE: usize = 4; // push a point every 4 IMU steps (≈50 Hz at 200 Hz IMU)
 const SNAPSHOT_LEN: usize = 48;
 
