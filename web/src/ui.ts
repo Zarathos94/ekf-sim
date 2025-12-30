@@ -291,6 +291,7 @@ function sectionLabel(text: string): HTMLElement {
   return el('div', 'section', text)
 }
 
+/** A labelled range with a synced, editable number field and a unit — all aligned. */
 function slider(
   label: string,
   min: number,
@@ -302,25 +303,41 @@ function slider(
 ): HTMLElement {
   const wrap = el('div', 'slider')
   const head = el('div', 'slabel')
-  head.append(el('span', undefined, label))
-  const val = el('span', 'sval', fmt(value, unit))
-  head.append(val)
-  const input = el('input')
-  input.type = 'range'
-  input.min = String(min)
-  input.max = String(max)
-  input.step = String(step)
-  input.value = String(value)
-  input.addEventListener('input', () => {
-    const v = Number(input.value)
-    val.textContent = fmt(v, unit)
+  const num = el('input', 'snum')
+  num.type = 'number'
+  num.min = String(min)
+  num.max = String(max)
+  num.step = String(step)
+  num.value = String(value)
+  head.append(el('span', 'sname2', label), num, el('span', 'sunit', unit))
+
+  const range = el('input', 'srange')
+  range.type = 'range'
+  range.min = String(min)
+  range.max = String(max)
+  range.step = String(step)
+  range.value = String(value)
+
+  const clampV = (v: number) => Math.min(max, Math.max(min, v))
+  range.addEventListener('input', () => {
+    const v = Number(range.value)
+    num.value = String(v)
     onInput(v)
   })
-  wrap.append(head, input)
-  return wrap
-}
+  num.addEventListener('input', () => {
+    const raw = Number(num.value)
+    if (Number.isNaN(raw)) return
+    const v = clampV(raw)
+    range.value = String(v)
+    onInput(v)
+  })
+  num.addEventListener('blur', () => {
+    const v = clampV(Number(num.value) || min)
+    num.value = String(v)
+    range.value = String(v)
+    onInput(v)
+  })
 
-function fmt(v: number, unit: string): string {
-  const s = v < 0.01 && v > 0 ? v.toExponential(1) : v.toFixed(v < 1 ? 3 : 2)
-  return unit ? `${s} ${unit}` : s
+  wrap.append(head, range)
+  return wrap
 }
