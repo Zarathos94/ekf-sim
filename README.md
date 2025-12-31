@@ -28,6 +28,10 @@ Monte-Carlo consistency check — 40 flights of 30 s, all sensors on
 CONSISTENT — the filter's covariance matches its error. Gate PASSED.
 ```
 
+A full technical write-up — the derivation, the six measurement Jacobians, the NEES consistency
+methodology, and the results — is in **[`paper/ekf-sim.pdf`](paper/ekf-sim.pdf)**
+([LaTeX source](paper/ekf-sim.tex)).
+
 ## The filter
 
 Error-state (indirect) Kalman filter in the formulation of Solà, *Quaternion kinematics for the

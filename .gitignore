@@ -32,3 +32,9 @@ npm-debug.log*
 # Environment
 .env
 .env.local
+
+# LaTeX build intermediates (the committed PDF is the artifact)
+/paper/*.aux
+/paper/*.log
+/paper/*.out
+/paper/*.synctex.gz

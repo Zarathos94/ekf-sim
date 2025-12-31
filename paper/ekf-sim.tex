@@ -1,0 +1,350 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\R}{\mathbf{R}}
+\newcommand{\I}{\mathbf{I}}
+\newcommand{\bp}{\mathbf{p}}
+\newcommand{\bv}{\mathbf{v}}
+\newcommand{\ba}{\mathbf{a}}
+\newcommand{\bg}{\mathbf{g}}
+\newcommand{\bomega}{\bm{\omega}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\bK}{\mathbf{K}}
+\newcommand{\bH}{\mathbf{H}}
+\newcommand{\bF}{\mathbf{F}}
+\newcommand{\bP}{\mathbf{P}}
+\newcommand{\bQ}{\mathbf{Q}}
+\newcommand{\bz}{\mathbf{z}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\skewm}[1]{\lfloor #1 \rfloor_\times}
+\newcommand{\dtheta}{\delta\bm{\theta}}
+\newcommand{\dx}{\delta\bx}
+
+\title{\textbf{A Consistency-Gated Quaternion Error-State Kalman Filter\\ for Multi-Sensor Inertial Navigation}}
+\author{Irfan Saric}
+\date{December 2025}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe the design, implementation, and verification of an error-state Kalman filter (ESKF)
+that fuses a strapdown inertial measurement unit (IMU) with GPS, a barometric altimeter, a
+magnetometer, a downward laser altimeter (LiDAR), ultra-wideband (UWB) radio ranging, and optical
+flow to estimate the pose of an aerial vehicle. The filter follows the multiplicative, local
+error-state formulation of Sol\`a~\cite{sola2017} and Trawny and Roumeliotis~\cite{trawny2005}: a
+nominal state carries the full estimate and is integrated directly from the IMU, while a minimal
+$15$-dimensional error state, reset to zero after every correction, carries the covariance. Each
+measurement model is given with its exact error-state Jacobian, and every Jacobian is validated
+against a finite difference. The central claim is not merely that the filter tracks well but that
+its \emph{reported uncertainty is correct}: we verify this with the normalized estimation error
+squared (NEES) consistency test of Bar-Shalom~et~al.~\cite{barshalom2001}, run as a Monte-Carlo gate
+over many simulated flights. On the full seven-sensor problem the filter is statistically
+consistent (position NEES $2.84$ against an expected $3.0$; full-state NEES $15.6$ against $15.0$),
+while remaining faithful to inertial-navigation error theory: with all aiding removed, the position
+error grows without bound, and it is recovered to sub-metre accuracy when a single aiding modality,
+including UWB ranging alone, is restored.
+\end{abstract}
+
+\section{Introduction}
+
+Aided inertial navigation estimates a vehicle's position, velocity, and orientation by integrating
+high-rate inertial measurements and correcting the accumulated drift with lower-rate aiding sensors
+\cite{farrell2008,groves2013}. Orientation makes the problem subtle: a unit quaternion has four
+components but only three degrees of freedom, so a filter that estimates it directly must either
+enforce the unit-norm constraint or carry a covariance for a quantity that is not free to move in
+four directions. The \emph{error-state} (or indirect, or multiplicative) Kalman filter resolves this
+by estimating a minimal three-parameter rotation error in the tangent space of the current attitude
+estimate~\cite{markley2003,sola2017}. This paper documents such a filter, its six measurement
+models, and---most importantly---the statistical test that proves its covariance honest.
+
+The contribution is one of rigor and reproducibility rather than novelty of formulation: the filter
+is a faithful implementation of the standard local-error ESKF, but each Jacobian is
+finite-difference-checked, the whole estimation loop is gated on NEES consistency, and the entire
+system---core, simulator, and a real-time three-dimensional visualization---runs in the browser via
+WebAssembly and WebGL2. Source and an interactive demonstration are available at
+\url{https://github.com/Zarathos94/ekf-sim} and \url{https://irfansaric.com/showcase/ekf-sim}.
+
+\section{State Representation}
+
+The \textbf{nominal state} collects position $\bp\in\mathbb{R}^3$, velocity $\bv\in\mathbb{R}^3$,
+orientation as a Hamilton unit quaternion $\bq\in\mathbb{S}^3$ (body to world), and the
+accelerometer and gyroscope biases $\ba_b,\bomega_b\in\mathbb{R}^3$:
+\begin{equation}
+  \bx = (\bp,\ \bv,\ \bq,\ \ba_b,\ \bomega_b).
+\end{equation}
+The \textbf{error state} is the $15$-vector
+\begin{equation}
+  \dx = (\delta\bp,\ \delta\bv,\ \dtheta,\ \delta\ba_b,\ \delta\bomega_b) \in \mathbb{R}^{15},
+\end{equation}
+where the rotation error $\dtheta$ is defined \emph{locally} (in the body frame) through the
+multiplicative relation
+\begin{equation}
+  \bq_{\text{true}} = \bq \otimes \exp\!\left(\tfrac{1}{2}\dtheta\right),
+  \label{eq:localerror}
+\end{equation}
+with $\exp(\cdot)$ the quaternion exponential map and $\otimes$ the Hamilton product. The nominal
+state holds the full, unconstrained estimate; the error state, kept near zero, holds a covariance
+$\bP\in\mathbb{R}^{15\times15}$ whose orientation block is an ordinary $3\times3$ matrix rather than
+a constrained $4\times4$ one. We write $\R=\R(\bq)$ for the rotation matrix and
+$\skewm{\cdot}:\mathbb{R}^3\to\mathfrak{so}(3)$ for the skew-symmetric ``cross-product'' operator,
+so that $\skewm{\ba}\bv = \ba\times\bv$.
+
+\section{Propagation}
+
+At each IMU sample (rate $\approx\SI{200}{\hertz}$, interval $\Delta t$) with accelerometer reading
+$\ba_m$ and gyroscope reading $\bomega_m$, define the bias-corrected specific force and body rate
+\begin{equation}
+  \ba = \ba_m - \ba_b, \qquad \bomega = \bomega_m - \bomega_b .
+\end{equation}
+
+\paragraph{Nominal integration.} With gravity $\bg = (0,0,-\SI{9.80665}{\metre\per\second\squared})$,
+\begin{align}
+  \bp &\leftarrow \bp + \bv\,\Delta t + \tfrac{1}{2}(\R\ba + \bg)\,\Delta t^2, \\
+  \bv &\leftarrow \bv + (\R\ba + \bg)\,\Delta t, \\
+  \bq &\leftarrow \bq \otimes \exp\!\left(\tfrac{1}{2}\bomega\,\Delta t\right),
+\end{align}
+with the quaternion renormalized after each step; the biases are constant under nominal
+integration.
+
+\paragraph{Error-state transition.} Linearizing the local error dynamics gives
+$\dx \leftarrow \bF\,\dx$ with the block matrix
+\begin{equation}
+  \bF =
+  \begin{bmatrix}
+    \I & \I\,\Delta t & \mathbf{0} & \mathbf{0} & \mathbf{0} \\
+    \mathbf{0} & \I & -\R\skewm{\ba}\,\Delta t & -\R\,\Delta t & \mathbf{0} \\
+    \mathbf{0} & \mathbf{0} & \exp(-\skewm{\bomega}\,\Delta t) & \mathbf{0} & -\I\,\Delta t \\
+    \mathbf{0} & \mathbf{0} & \mathbf{0} & \I & \mathbf{0} \\
+    \mathbf{0} & \mathbf{0} & \mathbf{0} & \mathbf{0} & \I
+  \end{bmatrix},
+  \label{eq:F}
+\end{equation}
+in which the velocity-error coupling $-\R\skewm{\ba}$ is the first-order effect of an orientation
+error on the rotated specific force, and the orientation block $\exp(-\skewm{\bomega}\Delta t)$ is
+the exact rotation integral (evaluated via Rodrigues' formula) rather than its first-order
+truncation~\cite{sola2017}.
+
+\paragraph{Process noise.} The covariance propagates as $\bP \leftarrow \bF\bP\bF^{\!\top} + \bQ$
+with the block-diagonal
+\begin{equation}
+  \bQ = \operatorname{diag}\!\big(\mathbf{0},\ \sigma_a^2\Delta t^2\,\I,\ \sigma_g^2\Delta t^2\,\I,\
+  \sigma_{ab}^2\Delta t\,\I,\ \sigma_{\omega b}^2\Delta t\,\I\big).
+\end{equation}
+The IMU white-noise terms scale as $\Delta t^2$: a per-sample noise of standard deviation $\sigma$
+perturbs the integrated velocity or orientation by $\sigma\Delta t$ over the step, injecting a
+variance $\sigma^2\Delta t^2$ (this is also the only dimensionally consistent choice---$\sigma^2\Delta t$
+would carry units of $\mathrm{m^2/s^3}$, not $\mathrm{(m/s)^2}$). The bias random walks scale as
+$\Delta t$. A mis-scaled $\bQ$ is invisible in the RMSE but glaring in the NEES of
+Section~\ref{sec:nees}.
+
+\section{Measurement Updates}
+
+For a measurement $\bz$ with model $\bz = h(\bx) + \bm{\nu}$, $\bm{\nu}\sim\mathcal{N}(0,\bm{R})$,
+the Jacobian $\bH = \partial h / \partial \dx$ is evaluated at the nominal state and the correction is
+the standard sequence
+\begin{align}
+  \bm{S} &= \bH\bP\bH^{\!\top} + \bm{R}, &
+  \bK &= \bP\bH^{\!\top}\bm{S}^{-1}, &
+  \dx &= \bK\big(\bz - h(\bx)\big),
+  \label{eq:kalman}
+\end{align}
+followed by injection (Section~\ref{sec:inject}) and the Joseph-form covariance update
+\begin{equation}
+  \bP \leftarrow (\I - \bK\bH)\,\bP\,(\I - \bK\bH)^{\!\top} + \bK\bm{R}\bK^{\!\top},
+  \label{eq:joseph}
+\end{equation}
+which preserves symmetric positive-definiteness under finite precision where the shorter
+$(\I-\bK\bH)\bP$ form drifts. The six models, each with the non-zero blocks of $\bH$, are:
+
+\begin{itemize}
+  \item \textbf{GPS} (position): $h(\bx) = \bp$, so $\partial h/\partial\delta\bp = \I_3$.
+  \item \textbf{Barometer} (altitude): $h(\bx) = \bm{e}_3^{\top}\bp$, so
+        $\partial h/\partial\delta\bp = \bm{e}_3^{\top}$.
+  \item \textbf{Magnetometer}: the world reference field $\bm{m}$ resolved in the body frame,
+        $h(\bx) = \R^{\!\top}\bm{m}$. Using \eqref{eq:localerror},
+        $\partial h/\partial\dtheta = \skewm{\R^{\!\top}\bm{m}}$, giving heading observability from
+        the full vector rather than a yaw pseudo-measurement.
+  \item \textbf{LiDAR altimeter}: a downward laser range to flat ground $z=0$ along the tilted body
+        axis, $h(\bx) = p_z / R_{33}$, where $R_{33} = \bm{e}_3^{\top}\R\,\bm{e}_3$. Both
+        $\partial h/\partial p_z = 1/R_{33}$ and
+        $\partial h/\partial\dtheta = -\frac{p_z}{R_{33}^2}\,[-R_{32},\,R_{31},\,0]$ are non-zero, so a
+        single beam senses height \emph{and} attitude.
+  \item \textbf{UWB radio ranging}: scalar range to a fixed beacon $\bm{b}_k$ at a known position,
+        $h(\bx) = \lVert\bp - \bm{b}_k\rVert$, with $\partial h/\partial\delta\bp = \hat{\bm{u}}^{\top}$,
+        the unit line of sight. Being position-only, a few beacons localize the vehicle with no GPS
+        at all~\cite{mueller2015}.
+  \item \textbf{Optical flow}: the body-frame horizontal velocity $h(\bx) = \Pi\,\R^{\!\top}\bv$,
+        with $\Pi$ selecting the first two components, so $\partial h/\partial\delta\bv = \Pi\R^{\!\top}$
+        and $\partial h/\partial\dtheta = \Pi\skewm{\R^{\!\top}\bv}$; it observes velocity and
+        attitude~\cite{honegger2013}.
+\end{itemize}
+
+Every Jacobian above is checked in the test suite against a central finite difference of its
+measurement function across all $15$ error directions, agreeing to $10^{-4}$.
+
+\section{Injection and Reset}
+\label{sec:inject}
+
+The error-state correction is folded into the nominal state and the error reset to zero:
+\begin{equation}
+  \bp \leftarrow \bp + \delta\bp,\quad
+  \bv \leftarrow \bv + \delta\bv,\quad
+  \bq \leftarrow \bq\otimes\exp\!\left(\tfrac12\dtheta\right),\quad
+  \ba_b \leftarrow \ba_b + \delta\ba_b,\quad
+  \bomega_b \leftarrow \bomega_b + \delta\bomega_b .
+\end{equation}
+Because the linearization point of the orientation error moves onto the new nominal quaternion, the
+covariance is transformed by the reset Jacobian
+\begin{equation}
+  \bP \leftarrow \bm{G}\,\bP\,\bm{G}^{\!\top},\qquad
+  \bm{G} = \operatorname{diag}\!\big(\I,\I,\ \I-\tfrac12\skewm{\dtheta},\ \I,\I\big).
+\end{equation}
+The term $\I-\tfrac12\skewm{\dtheta}$ is close to identity and is frequently omitted; retaining it is
+one of the small details the consistency test rewards.
+
+\section{Consistency: The NEES Gate}
+\label{sec:nees}
+
+An estimator that tracks well but reports the wrong uncertainty is not merely inelegant---it will
+mislead whatever consumes its covariance. The decisive test is \emph{statistical consistency}: the
+normalized estimation error squared~\cite{barshalom2001}
+\begin{equation}
+  \varepsilon = \bm{e}^{\top}\bP^{-1}\bm{e},
+\end{equation}
+where $\bm{e}$ is the estimation error expressed in the same $15$-dimensional tangent space that
+$\bP$ describes (position and velocity differences, the body-frame logarithmic map for orientation,
+and bias differences). For a consistent filter, $\mathbb{E}[\varepsilon] = \dim$. Averaged over $N$
+independent Monte-Carlo runs, $N\bar\varepsilon \sim \chi^2(N\cdot\dim)$, which yields the two-sided
+$95\%$ acceptance interval
+\begin{equation}
+  \bar\varepsilon \in
+  \left[\ \frac{\chi^2_{0.025}(N\cdot\dim)}{N},\ \frac{\chi^2_{0.975}(N\cdot\dim)}{N}\ \right].
+  \label{eq:neesband}
+\end{equation}
+A filter that is overconfident (covariance too small) lands above the band; one that is conservative
+lands below. The runs are seeded from a realistic initial error drawn from the initial covariance, so
+the test scores the filter and not an omniscient initialization.
+
+\section{Simulation Environment}
+
+Ground truth is an analytic banking helical trajectory---a horizontal orbit of radius \SI{40}{\metre}
+and period \SI{30}{\second} with a superimposed vertical oscillation---so position, velocity, and
+acceleration are exact and no integration error contaminates the reference. Orientation follows a
+coordinated turn (nose along velocity, rolled into the turn by the bank angle that balances lateral
+acceleration against gravity), and the body angular rate is obtained by central-differencing the
+quaternion path. From this truth a strapdown IMU (specific force and body rate, with bias random
+walk and white noise), and lower-rate GPS, barometer, magnetometer, LiDAR, UWB, and optical-flow
+measurements are synthesized. Every noise level, bias-walk density, and per-sensor availability is a
+parameter, so degradation and recovery can be driven interactively.
+
+\section{Results}
+
+Table~\ref{tab:nees} reports the Monte-Carlo consistency check over $40$ flights of \SI{30}{\second}
+with all seven sensors active. Both the position ($3$-DOF) and full-state ($15$-DOF) NEES fall
+inside the $95\%$ band of \eqref{eq:neesband}: the filter's covariance matches its error. The
+time-averaged RMSE over the same runs is \SI{0.080}{\metre} in position, \SI{0.042}{\metre\per\second}
+in velocity, and \SI{0.222}{\degree} in attitude.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lccc}
+    \toprule
+    Quantity & NEES mean & Expected & $95\%$ band \\
+    \midrule
+    Position (3-DOF)   & $2.84$  & $3.0$  & $[2.29,\ 3.81]$ \\
+    Full state (15-DOF) & $15.64$ & $15.0$ & $[13.35,\ 16.74]$ \\
+    \bottomrule
+  \end{tabular}
+  \caption{NEES consistency over $40$ Monte-Carlo flights. Both statistics lie inside the band,
+  i.e.\ the reported uncertainty is neither over- nor under-confident.}
+  \label{tab:nees}
+\end{table}
+
+Table~\ref{tab:scenarios} shows steady-state RMSE as sensors are removed or degraded. Two rows make
+the inertial-navigation physics visible. With \emph{all} aiding removed, the filter dead-reckons on
+the IMU alone and the position error grows without bound, reaching hundreds of metres over
+\SI{30}{\second}---exactly the quadratic error growth that accelerometer and gyroscope bias predict
+for an unaided strapdown system~\cite{groves2013}. Yet a single position-fixing modality restores
+sub-metre accuracy: with GPS denied but UWB ranging enabled, the error collapses from
+\SI{16.6}{\metre} to \SI{0.16}{\metre}, confirming that the radio-ranging model and its Jacobian are
+correct and that the filter degrades and recovers gracefully.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lccc}
+    \toprule
+    Scenario & Position (m) & Velocity (m/s) & Attitude (\si{\degree}) \\
+    \midrule
+    Nominal (GPS + baro + mag)        & $0.47$   & $0.24$  & $0.99$ \\
+    IMU only (dead reckoning)         & $295$    & $25.4$  & $8.3$  \\
+    GPS dropout                       & $16.6$   & $1.87$  & $2.05$ \\
+    GPS denied $+$ UWB ranging        & $0.16$   & $0.10$  & $0.61$ \\
+    Noisy IMU ($5\times$)             & $0.48$   & $0.26$  & $1.06$ \\
+    Bias drift ($10\times$)           & $0.52$   & $0.33$  & $1.53$ \\
+    \bottomrule
+  \end{tabular}
+  \caption{Steady-state RMSE by scenario (mean of $12$ flights of \SI{30}{\second} each). Dead
+  reckoning diverges; any single position fix, including UWB alone, recovers it.}
+  \label{tab:scenarios}
+\end{table}
+
+\section{Conclusion}
+
+We have presented a quaternion error-state Kalman filter fusing seven sensors for inertial
+navigation, in the standard local-error formulation, with each measurement Jacobian derived and
+finite-difference-verified. The emphasis throughout is that correctness is \emph{demonstrated}, not
+asserted: the full estimation loop passes a Monte-Carlo NEES consistency gate, and the filter
+reproduces the expected inertial-navigation behavior---unbounded dead-reckoning drift, and graceful
+recovery from any single position aid, including GPS-denied UWB ranging. The complete system, from
+the dependency-free numerical core to a real-time 3D visualization, is open source and runs in the
+browser.
+
+\begin{thebibliography}{9}
+
+\bibitem{kalman1960}
+R.~E. Kalman, ``A new approach to linear filtering and prediction problems,''
+\emph{Journal of Basic Engineering}, vol.~82, no.~1, pp.~35--45, 1960.
+
+\bibitem{sola2017}
+J.~Sol\`a, ``Quaternion kinematics for the error-state Kalman filter,''
+arXiv:1711.02508, 2017.
+
+\bibitem{trawny2005}
+N.~Trawny and S.~I. Roumeliotis, ``Indirect Kalman filter for 3D attitude estimation,''
+University of Minnesota, Dept.\ of Comp.\ Sci.\ \& Eng., Tech.\ Rep.\ 2005-002, 2005.
+
+\bibitem{markley2003}
+F.~L. Markley, ``Attitude error representations for Kalman filtering,''
+\emph{Journal of Guidance, Control, and Dynamics}, vol.~26, no.~2, pp.~311--317, 2003.
+
+\bibitem{barshalom2001}
+Y.~Bar-Shalom, X.~R. Li, and T.~Kirubarajan, \emph{Estimation with Applications to Tracking and
+Navigation}. New York: Wiley, 2001.
+
+\bibitem{farrell2008}
+J.~A. Farrell, \emph{Aided Navigation: GPS with High Rate Sensors}. New York: McGraw-Hill, 2008.
+
+\bibitem{groves2013}
+P.~D. Groves, \emph{Principles of GNSS, Inertial, and Multisensor Integrated Navigation Systems},
+2nd~ed. Boston: Artech House, 2013.
+
+\bibitem{mueller2015}
+M.~W. Mueller, M.~Hamer, and R.~D'Andrea, ``Fusing ultra-wideband range measurements with
+accelerometers and rate gyroscopes for quadrocopter state estimation,''
+in \emph{IEEE Int.\ Conf.\ on Robotics and Automation (ICRA)}, 2015, pp.~1730--1736.
+
+\bibitem{honegger2013}
+D.~Honegger, L.~Meier, P.~Tanskanen, and M.~Pollefeys, ``An open source and open hardware embedded
+metric optical flow CMOS camera for indoor and outdoor applications,''
+in \emph{IEEE Int.\ Conf.\ on Robotics and Automation (ICRA)}, 2013, pp.~1736--1741.
+
+\end{thebibliography}
+
+\end{document}
