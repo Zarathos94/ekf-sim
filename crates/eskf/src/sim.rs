@@ -49,6 +49,15 @@ pub struct SimConfig {
     /// Optical-flow (body-frame horizontal velocity) noise, m/s, and its rate.
     pub flow_noise: f64,
     pub flow_rate: f64,
+    /// GPS Doppler velocity noise, m/s, and its rate.
+    pub gps_vel_noise: f64,
+    pub gps_vel_rate: f64,
+    /// Body-frame Doppler velocity (DVL / radar) noise, m/s, and its rate.
+    pub dvl_noise: f64,
+    pub dvl_rate: f64,
+    /// Attitude-fix (star tracker / vision) noise, rad, and its rate.
+    pub att_noise: f64,
+    pub att_rate: f64,
 
     /// Per-sensor enables. Turning GPS off is the urban-canyon dropout; turning UWB on is the
     /// radio-ranging fallback that keeps the estimate alive without it.
@@ -58,6 +67,9 @@ pub struct SimConfig {
     pub lidar_enabled: bool,
     pub uwb_enabled: bool,
     pub flow_enabled: bool,
+    pub gps_vel_enabled: bool,
+    pub dvl_enabled: bool,
+    pub att_enabled: bool,
 }
 
 impl Default for SimConfig {
@@ -80,12 +92,21 @@ impl Default for SimConfig {
             uwb_rate: 10.0,
             flow_noise: 0.15,
             flow_rate: 30.0,
+            gps_vel_noise: 0.1,
+            gps_vel_rate: 5.0,
+            dvl_noise: 0.05,
+            dvl_rate: 20.0,
+            att_noise: 0.01,
+            att_rate: 20.0,
             gps_enabled: true,
             baro_enabled: true,
             mag_enabled: true,
             lidar_enabled: false,
             uwb_enabled: false,
             flow_enabled: false,
+            gps_vel_enabled: false,
+            dvl_enabled: false,
+            att_enabled: false,
         }
     }
 }
@@ -123,6 +144,9 @@ pub struct Tick {
     pub lidar: Option<f64>,
     pub uwb: Option<[f64; 4]>,
     pub flow: Option<[f64; 2]>,
+    pub gps_vel: Option<V3>,
+    pub dvl: Option<V3>,
+    pub att: Option<Quat>,
 }
 
 pub struct Simulator {
@@ -137,6 +161,9 @@ pub struct Simulator {
     next_lidar: f64,
     next_uwb: f64,
     next_flow: f64,
+    next_gps_vel: f64,
+    next_dvl: f64,
+    next_att: f64,
 }
 
 impl Simulator {
@@ -154,6 +181,9 @@ impl Simulator {
             next_lidar: 0.0,
             next_uwb: 0.0,
             next_flow: 0.0,
+            next_gps_vel: 0.0,
+            next_dvl: 0.0,
+            next_att: 0.0,
         }
     }
 
@@ -295,6 +325,41 @@ impl Simulator {
             None
         };
 
+        // GPS Doppler velocity (world frame).
+        let gps_vel = if due(t, &mut self.next_gps_vel, self.cfg.gps_vel_rate, self.cfg.gps_vel_enabled) {
+            Some([
+                s.v[0] + self.rng.gaussian() * self.cfg.gps_vel_noise,
+                s.v[1] + self.rng.gaussian() * self.cfg.gps_vel_noise,
+                s.v[2] + self.rng.gaussian() * self.cfg.gps_vel_noise,
+            ])
+        } else {
+            None
+        };
+
+        // Doppler velocity log / radar: full body-frame velocity.
+        let dvl = if due(t, &mut self.next_dvl, self.cfg.dvl_rate, self.cfg.dvl_enabled) {
+            let vb = s.q.rotate_inv(s.v);
+            Some([
+                vb[0] + self.rng.gaussian() * self.cfg.dvl_noise,
+                vb[1] + self.rng.gaussian() * self.cfg.dvl_noise,
+                vb[2] + self.rng.gaussian() * self.cfg.dvl_noise,
+            ])
+        } else {
+            None
+        };
+
+        // Attitude fix (star tracker / vision): a noisy orientation.
+        let att = if due(t, &mut self.next_att, self.cfg.att_rate, self.cfg.att_enabled) {
+            let n = [
+                self.rng.gaussian() * self.cfg.att_noise,
+                self.rng.gaussian() * self.cfg.att_noise,
+                self.rng.gaussian() * self.cfg.att_noise,
+            ];
+            Some(s.q.mul(Quat::from_rotation_vector(n)))
+        } else {
+            None
+        };
+
         let truth = TrueState {
             p: s.p,
             v: s.v,
@@ -303,7 +368,7 @@ impl Simulator {
             gyro_bias: self.gyro_bias,
         };
         self.t += dt;
-        Tick { t, dt, truth, accel, gyro, gps, baro, mag, lidar, uwb, flow }
+        Tick { t, dt, truth, accel, gyro, gps, baro, mag, lidar, uwb, flow, gps_vel, dvl, att }
     }
 }
 

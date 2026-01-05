@@ -10,7 +10,7 @@
 //! for the error-state Kalman filter" (2017), with the local (body-frame) angular error.
 
 use crate::linalg::{col3, skew, v3, Mat, V3};
-use crate::quat::Quat;
+use crate::quat::{boxminus, Quat};
 
 // Error-state block offsets.
 const IP: usize = 0; // position
@@ -242,6 +242,46 @@ impl Eskf {
             }
         }
         ([vb[0], vb[1]], h)
+    }
+
+    /// GPS Doppler velocity: a direct world-frame velocity measurement, `h = v`.
+    pub fn update_gps_velocity(&mut self, vel: V3, sigma: f64) {
+        let mut h = Mat::<3, N>::zeros();
+        h.set_block(0, IV, &Mat::<3, 3>::identity());
+        let residual = col3(v3::sub(vel, self.nom.v));
+        let r = Mat::<3, 3>::identity().scale(sigma * sigma);
+        self.update(&h, &residual, &r);
+    }
+
+    /// A body-frame 3-D velocity sensor (Doppler velocity log / Doppler radar): the full velocity
+    /// resolved in the body frame, `h = Rᵀ v`. Like optical flow but all three axes, so it also
+    /// bounds vertical velocity.
+    pub fn update_body_velocity(&mut self, vel_body: V3, sigma: f64) {
+        let (pred, h) = self.body_velocity_predict();
+        let residual = col3(v3::sub(vel_body, pred));
+        let r = Mat::<3, 3>::identity().scale(sigma * sigma);
+        self.update(&h, &residual, &r);
+    }
+
+    pub(crate) fn body_velocity_predict(&self) -> (V3, Mat<3, N>) {
+        let rt = self.nom.q.to_matrix().transpose();
+        let vb = mat_vec(&rt, self.nom.v);
+        let mut h = Mat::<3, N>::zeros();
+        h.set_block(0, IV, &rt); // ∂(Rᵀv)/∂δv = Rᵀ
+        h.set_block(0, ITH, &skew(vb)); // ∂(Rᵀv)/∂δθ = [Rᵀv]×
+        (vb, h)
+    }
+
+    /// A direct attitude fix (star tracker, or a visual-inertial / AHRS orientation output). The
+    /// measurement is an orientation `z_q`; the innovation is the body-frame rotation carrying the
+    /// nominal onto it, and the Jacobian is identity on the orientation error — the standard
+    /// multiplicative attitude update.
+    pub fn update_attitude(&mut self, z_q: Quat, sigma: f64) {
+        let residual = col3(boxminus(z_q, self.nom.q));
+        let mut h = Mat::<3, N>::zeros();
+        h.set_block(0, ITH, &Mat::<3, 3>::identity());
+        let r = Mat::<3, 3>::identity().scale(sigma * sigma);
+        self.update(&h, &residual, &r);
     }
 
     /// The generic Kalman correction for a measurement of dimension `M`: gain, inject, and a
@@ -510,5 +550,57 @@ mod tests {
             "range-only localization failed: {:?}",
             f.nom.p
         );
+    }
+
+    #[test]
+    fn body_velocity_jacobian_matches_finite_difference() {
+        let f = sample_filter();
+        let (_, jac) = f.body_velocity_predict();
+        let eps = 1e-6;
+        for i in 0..N {
+            let mut dp = [0.0; N];
+            let mut dm = [0.0; N];
+            dp[i] = eps;
+            dm[i] = -eps;
+            let fp = Eskf::new(apply_error(f.nom, dp), InitialSigma::default(), Noise::default());
+            let fm = Eskf::new(apply_error(f.nom, dm), InitialSigma::default(), Noise::default());
+            let (hp, _) = fp.body_velocity_predict();
+            let (hm, _) = fm.body_velocity_predict();
+            for row in 0..3 {
+                let numeric = (hp[row] - hm[row]) / (2.0 * eps);
+                assert!(
+                    (numeric - jac.m[row][i]).abs() < 1e-4,
+                    "body-velocity jacobian[{row}][{i}]: {numeric:.6} vs {:.6}",
+                    jac.m[row][i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gps_velocity_pulls_velocity_to_the_measurement() {
+        let nom = Nominal { v: [2.0, -1.0, 0.5], ..Nominal::at_rest([0.0; 3], Quat::IDENTITY) };
+        let mut f = Eskf::new(nom, InitialSigma::default(), Noise::default());
+        for _ in 0..80 {
+            f.update_gps_velocity([0.0, 0.0, 0.0], 0.1);
+        }
+        assert!(v3::norm(f.nom.v) < 0.2, "velocity did not converge: {:?}", f.nom.v);
+    }
+
+    #[test]
+    fn attitude_fix_converges_to_the_measurement() {
+        // Seed a ~20° orientation error; attitude fixes at truth must drive it down (which only
+        // happens if the update's sign is right — a flipped sign diverges).
+        let truth = Quat::from_rotation_vector([0.1, -0.2, 0.15]);
+        let nom = Nominal {
+            q: truth.mul(Quat::from_rotation_vector([0.35, 0.0, 0.0])),
+            ..Nominal::at_rest([0.0; 3], Quat::IDENTITY)
+        };
+        let mut f = Eskf::new(nom, InitialSigma::default(), Noise::default());
+        for _ in 0..80 {
+            f.update_attitude(truth, 0.02);
+        }
+        let err = v3::norm(boxminus(truth, f.nom.q)).to_degrees();
+        assert!(err < 1.0, "attitude did not converge: {err}°");
     }
 }
