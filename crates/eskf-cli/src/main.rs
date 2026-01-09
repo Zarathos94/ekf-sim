@@ -10,7 +10,9 @@
 //! looks fine.
 
 use eskf::sim::{SimConfig, BEACONS};
-use eskf::{nees, position_nees, Eskf, InitialSigma, Noise, Simulator, MAG_REFERENCE};
+use eskf::{
+    nees, position_nees, Eskf, InitialSigma, Nominal, Noise, Simulator, TrueState, MAG_REFERENCE,
+};
 
 const IMU_RATE: f64 = 200.0;
 
@@ -25,11 +27,230 @@ fn main() {
             }
         }
         "scenarios" => scenarios(),
+        "record" => {
+            let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(15.0);
+            let path = args.get(3).map(String::as_str).unwrap_or("data/reference-flight.csv");
+            if let Err(e) = cmd_record(seconds, path) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        "replay" => {
+            let path = args.get(2).map(String::as_str).unwrap_or("data/reference-flight.csv");
+            if let Err(e) = cmd_replay(path) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         other => {
-            eprintln!("unknown command '{other}'. Try: check | scenarios");
+            eprintln!("unknown command '{other}'. Try: check | scenarios | record | replay");
             std::process::exit(2);
         }
     }
+}
+
+/// Every sensor enabled — the full ten-modality fusion.
+fn full_config() -> SimConfig {
+    SimConfig {
+        lidar_enabled: true,
+        uwb_enabled: true,
+        flow_enabled: true,
+        gps_vel_enabled: true,
+        dvl_enabled: true,
+        att_enabled: true,
+        ..SimConfig::default()
+    }
+}
+
+const CSV_HEADER: &str = "t,ax,ay,az,gx,gy,gz,gps_x,gps_y,gps_z,baro,mag_x,mag_y,mag_z,lidar,\
+uwb0,uwb1,uwb2,uwb3,flow_x,flow_y,gpsv_x,gpsv_y,gpsv_z,dvl_x,dvl_y,dvl_z,att_w,att_x,att_y,att_z,\
+tp_x,tp_y,tp_z,tv_x,tv_y,tv_z,tq_w,tq_x,tq_y,tq_z";
+
+/// Records a flight to CSV: the raw IMU stream, every aiding measurement (empty where a sensor did
+/// not fire on that tick), and ground truth. A portable, replayable test dataset.
+fn cmd_record(seconds: f64, path: &str) -> Result<(), String> {
+    let mut sim = Simulator::new(full_config(), 0xE5F1_2024);
+    let steps = (seconds * IMU_RATE) as usize;
+
+    let mut out = String::from(CSV_HEADER);
+    out.push('\n');
+    let n = |x: f64| format!("{x:.5}");
+    for _ in 0..steps {
+        let tk = sim.step();
+        let mut f: Vec<String> = Vec::with_capacity(41);
+        f.push(n(tk.t));
+        for v in tk.accel {
+            f.push(n(v));
+        }
+        for v in tk.gyro {
+            f.push(n(v));
+        }
+        push_vec(&mut f, tk.gps.map(|v| v.to_vec()), 3);
+        push_vec(&mut f, tk.baro.map(|v| vec![v]), 1);
+        push_vec(&mut f, tk.mag.map(|v| v.to_vec()), 3);
+        push_vec(&mut f, tk.lidar.map(|v| vec![v]), 1);
+        push_vec(&mut f, tk.uwb.map(|v| v.to_vec()), 4);
+        push_vec(&mut f, tk.flow.map(|v| v.to_vec()), 2);
+        push_vec(&mut f, tk.gps_vel.map(|v| v.to_vec()), 3);
+        push_vec(&mut f, tk.dvl.map(|v| v.to_vec()), 3);
+        push_vec(&mut f, tk.att.map(|q| vec![q.w, q.x, q.y, q.z]), 4);
+        for v in tk.truth.p {
+            f.push(n(v));
+        }
+        for v in tk.truth.v {
+            f.push(n(v));
+        }
+        for v in [tk.truth.q.w, tk.truth.q.x, tk.truth.q.y, tk.truth.q.z] {
+            f.push(n(v));
+        }
+        out.push_str(&f.join(","));
+        out.push('\n');
+    }
+
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())?;
+    println!("wrote {path}: {steps} rows over {seconds:.0} s, all sensors");
+    Ok(())
+}
+
+fn push_vec(f: &mut Vec<String>, v: Option<Vec<f64>>, count: usize) {
+    match v {
+        Some(vals) => {
+            for x in vals {
+                f.push(format!("{x:.5}"));
+            }
+        }
+        None => {
+            for _ in 0..count {
+                f.push(String::new());
+            }
+        }
+    }
+}
+
+/// Replays a recorded dataset through the filter and reports RMSE and position-NEES consistency
+/// against the recorded ground truth — verifying the estimator on external data, not just a live
+/// run.
+fn cmd_replay(path: &str) -> Result<(), String> {
+    let data = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let mut lines = data.lines();
+    lines.next(); // header
+
+    let noise = Noise {
+        gravity: eskf::GRAVITY,
+        accel: SimConfig::default().accel_noise,
+        gyro: SimConfig::default().gyro_noise,
+        accel_bias: SimConfig::default().accel_bias_walk,
+        gyro_bias: SimConfig::default().gyro_bias_walk,
+    };
+    let cfg = SimConfig::default();
+
+    let mut filter: Option<Eskf> = None;
+    let mut prev_t = 0.0f64;
+    let (mut se_p, mut se_v, mut se_a, mut cnt) = (0.0, 0.0, 0.0, 0.0);
+    let mut pos_nees = Vec::new();
+    let mut rows = 0usize;
+
+    for line in lines {
+        let c: Vec<&str> = line.split(',').collect();
+        if c.len() < 41 {
+            continue;
+        }
+        rows += 1;
+        let g = |i: usize| c[i].parse::<f64>().unwrap_or(0.0);
+        let o1 = |i: usize| -> Option<f64> {
+            if c[i].is_empty() {
+                None
+            } else {
+                c[i].parse().ok()
+            }
+        };
+        let o3 = |i: usize| -> Option<[f64; 3]> {
+            if c[i].is_empty() {
+                None
+            } else {
+                Some([g(i), g(i + 1), g(i + 2)])
+            }
+        };
+
+        let t = g(0);
+        let accel = [g(1), g(2), g(3)];
+        let gyro = [g(4), g(5), g(6)];
+        let truth = TrueState {
+            p: [g(31), g(32), g(33)],
+            v: [g(34), g(35), g(36)],
+            q: eskf::Quat::new(g(37), g(38), g(39), g(40)),
+            accel_bias: [0.0; 3],
+            gyro_bias: [0.0; 3],
+        };
+
+        let f = filter.get_or_insert_with(|| {
+            let nom = Nominal { p: truth.p, v: truth.v, q: truth.q, accel_bias: [0.0; 3], gyro_bias: [0.0; 3] };
+            Eskf::new(nom, InitialSigma::default(), noise)
+        });
+
+        let dt = if prev_t > 0.0 { (t - prev_t).max(1e-4) } else { 1.0 / IMU_RATE };
+        prev_t = t;
+        f.predict(accel, gyro, dt);
+
+        if let Some(z) = o3(7) {
+            f.update_gps(z, cfg.gps_noise);
+        }
+        if let Some(z) = o1(10) {
+            f.update_baro(z, cfg.baro_noise);
+        }
+        if let Some(z) = o3(11) {
+            f.update_mag(z, MAG_REFERENCE, cfg.mag_noise);
+        }
+        if let Some(z) = o1(14) {
+            f.update_lidar_altimeter(z, cfg.lidar_noise);
+        }
+        if !c[15].is_empty() {
+            for (k, b) in BEACONS.iter().enumerate() {
+                f.update_range(*b, g(15 + k), cfg.uwb_noise);
+            }
+        }
+        if !c[19].is_empty() {
+            f.update_optical_flow([g(19), g(20)], cfg.flow_noise);
+        }
+        if let Some(z) = o3(21) {
+            f.update_gps_velocity(z, cfg.gps_vel_noise);
+        }
+        if let Some(z) = o3(24) {
+            f.update_body_velocity(z, cfg.dvl_noise);
+        }
+        if !c[27].is_empty() {
+            f.update_attitude(eskf::Quat::new(g(27), g(28), g(29), g(30)), cfg.att_noise);
+        }
+
+        if t >= 5.0 {
+            let dp = sub(f.nom.p, truth.p);
+            let dv = sub(f.nom.v, truth.v);
+            let dth = eskf::quat::boxminus(truth.q, f.nom.q);
+            se_p += dot(dp, dp);
+            se_v += dot(dv, dv);
+            se_a += dot(dth, dth);
+            cnt += 1.0;
+            if rows % 20 == 0 {
+                if let Some(v) = position_nees(&f.nom, &truth, f.covariance()) {
+                    pos_nees.push(v);
+                }
+            }
+        }
+    }
+
+    if cnt == 0.0 {
+        return Err("no usable rows in dataset".into());
+    }
+    let mean_nees = pos_nees.iter().sum::<f64>() / pos_nees.len().max(1) as f64;
+    println!("replayed {rows} rows from {path}\n");
+    println!("  RMSE   position {:.3} m   velocity {:.3} m/s   attitude {:.3}°", (se_p / cnt).sqrt(), (se_v / cnt).sqrt(), (se_a / cnt).sqrt().to_degrees());
+    println!("  position NEES mean {mean_nees:.3}   expected 3   ({})", if (1.5..4.5).contains(&mean_nees) { "consistent" } else { "OUT OF RANGE" });
+    Ok(())
 }
 
 /// Run one flight, feeding every sensor, and return per-step NEES samples (position 3-DOF and
@@ -37,6 +258,8 @@ fn main() {
 struct RunResult {
     pos_nees: Vec<f64>,
     full_nees: Vec<f64>,
+    /// (time, position-NEES) samples, for the consistency-over-time histogram.
+    pos_nees_time: Vec<(f64, f64)>,
     rmse_pos: f64,
     rmse_vel: f64,
     rmse_att_deg: f64,
@@ -53,6 +276,7 @@ fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
 
     let mut pos_nees = Vec::new();
     let mut full_nees = Vec::new();
+    let mut pos_nees_time = Vec::new();
     let (mut se_pos, mut se_vel, mut se_att, mut n_err) = (0.0, 0.0, 0.0, 0.0);
 
     for k in 0..steps {
@@ -78,6 +302,15 @@ fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
         if let Some(z) = tick.flow {
             f.update_optical_flow(z, cfg.flow_noise.max(1e-3));
         }
+        if let Some(z) = tick.gps_vel {
+            f.update_gps_velocity(z, cfg.gps_vel_noise.max(1e-3));
+        }
+        if let Some(z) = tick.dvl {
+            f.update_body_velocity(z, cfg.dvl_noise.max(1e-3));
+        }
+        if let Some(z) = tick.att {
+            f.update_attitude(z, cfg.att_noise.max(1e-4));
+        }
 
         if k >= settle {
             let dp = sub(f.nom.p, tick.truth.p);
@@ -91,6 +324,7 @@ fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
             if k % sample_every == 0 {
                 if let Some(v) = position_nees(&f.nom, &tick.truth, f.covariance()) {
                     pos_nees.push(v);
+                    pos_nees_time.push((k as f64 / IMU_RATE, v));
                 }
                 if let Some(v) = nees(&f.nom, &tick.truth, f.covariance()) {
                     full_nees.push(v);
@@ -102,6 +336,7 @@ fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
     RunResult {
         pos_nees,
         full_nees,
+        pos_nees_time,
         rmse_pos: (se_pos / n_err).sqrt(),
         rmse_vel: (se_vel / n_err).sqrt(),
         rmse_att_deg: (se_att / n_err).sqrt().to_degrees(),
@@ -129,6 +364,9 @@ fn consistency_check() -> bool {
         lidar_enabled: true,
         uwb_enabled: true,
         flow_enabled: true,
+        gps_vel_enabled: true,
+        dvl_enabled: true,
+        att_enabled: true,
         ..SimConfig::default()
     };
 
@@ -136,12 +374,17 @@ fn consistency_check() -> bool {
 
     let mut pos = Vec::new();
     let mut full = Vec::new();
+    let mut time_bins: Vec<Vec<f64>> = vec![Vec::new(); 5];
     let (mut rp, mut rv, mut ra) = (0.0, 0.0, 0.0);
     for seed in 0..runs {
         let r = run_flight(cfg, seed as u64 * 2_654_435_761, seconds);
         rp += r.rmse_pos;
         rv += r.rmse_vel;
         ra += r.rmse_att_deg;
+        for (t, v) in &r.pos_nees_time {
+            let b = (((t - 5.0) / 5.0) as usize).min(time_bins.len() - 1);
+            time_bins[b].push(*v);
+        }
         pos.extend(r.pos_nees);
         full.extend(r.full_nees);
     }
@@ -152,9 +395,21 @@ fn consistency_check() -> bool {
     let pos_ok = report_nees("position", &pos, 3, runs);
     let full_ok = report_nees("full state", &full, 15, runs);
 
+    // Consistency is not just an average — it must hold throughout the flight, not only in the mean.
+    println!("\n  position NEES over the flight (mean per 5 s window, expected 3.0):");
+    let mut time_ok = true;
+    for (i, b) in time_bins.iter().enumerate() {
+        let m = if b.is_empty() { 0.0 } else { b.iter().sum::<f64>() / b.len() as f64 };
+        let (lo, hi) = (5.0 + i as f64 * 5.0, 10.0 + i as f64 * 5.0);
+        // A generous per-window sanity band (windows have fewer samples than the pooled test).
+        let win_ok = (2.0..4.2).contains(&m);
+        time_ok &= win_ok;
+        println!("    {lo:>4.0}–{hi:<4.0}s   {m:.3}   {}", if win_ok { "ok" } else { "OUT" });
+    }
+
     println!();
-    let ok = pos_ok && full_ok;
-    println!("{}", if ok { "CONSISTENT — the filter's covariance matches its error. Gate PASSED." } else { "INCONSISTENT — covariance does not match the error. Gate FAILED." });
+    let ok = pos_ok && full_ok && time_ok;
+    println!("{}", if ok { "CONSISTENT — the filter's covariance matches its error, throughout. Gate PASSED." } else { "INCONSISTENT — covariance does not match the error. Gate FAILED." });
     ok
 }
 
@@ -186,8 +441,8 @@ type Scenario = (&'static str, fn(&mut SimConfig));
 
 fn scenarios() {
     let seconds = 30.0;
-    let cases: [Scenario; 6] = [
-        ("nominal", |_c| {}),
+    let cases: [Scenario; 9] = [
+        ("nominal (GPS+baro+mag)", |_c| {}),
         ("IMU only (dead-reckon)", |c| {
             c.gps_enabled = false;
             c.baro_enabled = false;
@@ -198,6 +453,24 @@ fn scenarios() {
         ("GPS-denied + UWB", |c| {
             c.gps_enabled = false;
             c.uwb_enabled = true;
+        }),
+        ("indoor: UWB+LiDAR+flow", |c| {
+            c.gps_enabled = false;
+            c.uwb_enabled = true;
+            c.lidar_enabled = true;
+            c.flow_enabled = true;
+        }),
+        ("vision-aided: att+DVL", |c| {
+            c.att_enabled = true;
+            c.dvl_enabled = true;
+        }),
+        ("full fusion (10 sensors)", |c| {
+            c.lidar_enabled = true;
+            c.uwb_enabled = true;
+            c.flow_enabled = true;
+            c.gps_vel_enabled = true;
+            c.dvl_enabled = true;
+            c.att_enabled = true;
         }),
         ("noisy IMU (5×)", |c| {
             c.accel_noise *= 5.0;
