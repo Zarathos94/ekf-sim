@@ -23,14 +23,32 @@ interface SensorDef {
   set: (s: Session, v: boolean) => void
 }
 
-// Order matches the snapshot's pulse block [36..42].
+// Order matches the snapshot's pulse block [36..45].
 const SENSORS: SensorDef[] = [
-  { label: 'GPS', on: true, pulse: 0, color: '#73bfff', set: (s, v) => s.set_gps_enabled(v) },
+  { label: 'GPS position', on: true, pulse: 0, color: '#73bfff', set: (s, v) => s.set_gps_enabled(v) },
   { label: 'Barometer', on: true, pulse: 1, color: '#8ad', set: (s, v) => s.set_baro_enabled(v) },
   { label: 'Magnetometer', on: true, pulse: 2, color: '#c9a', set: (s, v) => s.set_mag_enabled(v) },
   { label: 'LiDAR altimeter', on: false, pulse: 3, color: '#ffbe59', set: (s, v) => s.set_lidar_enabled(v) },
   { label: 'UWB radio ranging', on: false, pulse: 4, color: '#c78bff', set: (s, v) => s.set_uwb_enabled(v) },
   { label: 'Optical flow', on: false, pulse: 5, color: '#5be68d', set: (s, v) => s.set_flow_enabled(v) },
+  { label: 'GPS velocity', on: false, pulse: 6, color: '#5bb0e6', set: (s, v) => s.set_gps_vel_enabled(v) },
+  { label: 'Doppler velocity (DVL)', on: false, pulse: 7, color: '#e69a5b', set: (s, v) => s.set_dvl_enabled(v) },
+  { label: 'Attitude fix (vision)', on: false, pulse: 8, color: '#e65b9a', set: (s, v) => s.set_att_enabled(v) },
+]
+
+interface Preset {
+  name: string
+  // Enabled state in SENSORS order: gps, baro, mag, lidar, uwb, flow, gps_vel, dvl, att.
+  on: boolean[]
+}
+
+const PRESETS: Preset[] = [
+  { name: 'Aided INS (GPS + baro + mag)', on: [true, true, true, false, false, false, false, false, false] },
+  { name: 'Full fusion (all 10)', on: [true, true, true, true, true, true, true, true, true] },
+  { name: 'GPS-denied (UWB ranging)', on: [false, true, true, false, true, false, false, false, false] },
+  { name: 'Indoor (UWB + LiDAR + flow)', on: [false, true, true, true, true, true, false, false, false] },
+  { name: 'Vision-aided (attitude + DVL)', on: [false, true, true, false, false, false, false, true, true] },
+  { name: 'Dead reckoning (IMU only)', on: [false, false, false, false, false, false, false, false, false] },
 ]
 
 export class Ui {
@@ -45,6 +63,7 @@ export class Ui {
   private readonly rNeesDot: HTMLElement
   private readonly rTime: HTMLElement
   private readonly dots: HTMLElement[] = []
+  private readonly sensorInputs: HTMLInputElement[] = []
   private readonly plot: ConsistencyPlot
 
   constructor(root: HTMLElement, session: Session) {
@@ -93,6 +112,20 @@ export class Ui {
       slider('Error exaggeration', 1, 20, 4, 1, '×', (v) => this.onExaggerate(v)),
     )
 
+    rail.append(sectionLabel('Scenario preset'))
+    const presetSel = el('select', 'preset')
+    presetSel.append(el('option', undefined, '— choose a preset —'))
+    for (const p of PRESETS) presetSel.append(el('option', undefined, p.name))
+    presetSel.addEventListener('change', () => {
+      const p = PRESETS[presetSel.selectedIndex - 1]
+      if (!p) return
+      for (let i = 0; i < SENSORS.length; i++) {
+        this.sensorInputs[i]!.checked = p.on[i]!
+        SENSORS[i]!.set(session, p.on[i]!)
+      }
+    })
+    rail.append(presetSel)
+
     rail.append(sectionLabel('Sensors — toggle to see what each one buys'))
     for (const def of SENSORS) {
       def.set(session, def.on)
@@ -101,6 +134,7 @@ export class Ui {
       input.type = 'checkbox'
       input.checked = def.on
       input.addEventListener('change', () => def.set(session, input.checked))
+      this.sensorInputs.push(input)
       const dot = el('span', 'sdot')
       dot.style.background = def.color
       dot.style.opacity = '0.15'
@@ -123,6 +157,9 @@ export class Ui {
       slider('LiDAR noise', 0.02, 2.0, 0.15, 0.02, 'm', (v) => session.set_lidar_noise(v)),
       slider('UWB noise', 0.05, 3.0, 0.35, 0.05, 'm', (v) => session.set_uwb_noise(v)),
       slider('Optical-flow noise', 0.02, 1.0, 0.15, 0.02, 'm/s', (v) => session.set_flow_noise(v)),
+      slider('GPS-velocity noise', 0.02, 1.0, 0.1, 0.02, 'm/s', (v) => session.set_gps_vel_noise(v)),
+      slider('DVL noise', 0.01, 0.5, 0.05, 0.01, 'm/s', (v) => session.set_dvl_noise(v)),
+      slider('Attitude-fix noise', 0.002, 0.1, 0.01, 0.002, 'rad', (v) => session.set_att_noise(v)),
     )
 
     rail.append(sectionLabel('Consistency — error vs 3σ'))
@@ -163,8 +200,8 @@ export class Ui {
     const attErr = s[27]!
     const nees = s[28]!
     const t = s[29]!
-    const sigma3 = 3 * s[42]!
-    const instErr = s[43]!
+    const sigma3 = 3 * s[45]!
+    const instErr = s[46]!
 
     this.rPos.lastChild!.textContent = `${posErr.toFixed(2)} m`
     this.rAtt.textContent = `${attErr.toFixed(2)}°`

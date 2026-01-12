@@ -25,6 +25,10 @@ const S_MAG: usize = 2;
 const S_LIDAR: usize = 3;
 const S_UWB: usize = 4;
 const S_FLOW: usize = 5;
+const S_GPS_VEL: usize = 6;
+const S_DVL: usize = 7;
+const S_ATT: usize = 8;
+const N_SENSORS: usize = 9;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -60,7 +64,7 @@ pub struct Session {
     ema_att: f64,
     ema_nees: f64,
     inst_pos: f64,
-    pulse: [f32; 6],
+    pulse: [f32; N_SENSORS],
 
     snapshot: Vec<f32>,
 }
@@ -86,7 +90,7 @@ impl Session {
             ema_att: 0.0,
             ema_nees: 3.0,
             inst_pos: 0.0,
-            pulse: [0.0; 6],
+            pulse: [0.0; N_SENSORS],
             snapshot: vec![0.0; SNAPSHOT_LEN],
         }
     }
@@ -104,7 +108,7 @@ impl Session {
         self.ema_att = 0.0;
         self.ema_nees = 3.0;
         self.inst_pos = 0.0;
-        self.pulse = [0.0; 6];
+        self.pulse = [0.0; N_SENSORS];
     }
 
     // --- Sensor noise (the simulator's actual noise; the filter's assumed noise tracks the IMU
@@ -154,6 +158,18 @@ impl Session {
         self.cfg.flow_noise = v;
         self.sim.cfg.flow_noise = v;
     }
+    pub fn set_gps_vel_noise(&mut self, v: f64) {
+        self.cfg.gps_vel_noise = v;
+        self.sim.cfg.gps_vel_noise = v;
+    }
+    pub fn set_dvl_noise(&mut self, v: f64) {
+        self.cfg.dvl_noise = v;
+        self.sim.cfg.dvl_noise = v;
+    }
+    pub fn set_att_noise(&mut self, v: f64) {
+        self.cfg.att_noise = v;
+        self.sim.cfg.att_noise = v;
+    }
 
     // --- Per-sensor enables. ---
 
@@ -180,6 +196,18 @@ impl Session {
     pub fn set_flow_enabled(&mut self, on: bool) {
         self.cfg.flow_enabled = on;
         self.sim.cfg.flow_enabled = on;
+    }
+    pub fn set_gps_vel_enabled(&mut self, on: bool) {
+        self.cfg.gps_vel_enabled = on;
+        self.sim.cfg.gps_vel_enabled = on;
+    }
+    pub fn set_dvl_enabled(&mut self, on: bool) {
+        self.cfg.dvl_enabled = on;
+        self.sim.cfg.dvl_enabled = on;
+    }
+    pub fn set_att_enabled(&mut self, on: bool) {
+        self.cfg.att_enabled = on;
+        self.sim.cfg.att_enabled = on;
     }
 
     /// Advance by `dt` seconds of wall-clock time, running the matching number of IMU steps
@@ -225,6 +253,18 @@ impl Session {
         if let Some(z) = tick.flow {
             self.filter.update_optical_flow(z, self.cfg.flow_noise.max(1e-3));
             self.pulse[S_FLOW] = 1.0;
+        }
+        if let Some(z) = tick.gps_vel {
+            self.filter.update_gps_velocity(z, self.cfg.gps_vel_noise.max(1e-3));
+            self.pulse[S_GPS_VEL] = 1.0;
+        }
+        if let Some(z) = tick.dvl {
+            self.filter.update_body_velocity(z, self.cfg.dvl_noise.max(1e-3));
+            self.pulse[S_DVL] = 1.0;
+        }
+        if let Some(z) = tick.att {
+            self.filter.update_attitude(z, self.cfg.att_noise.max(1e-4));
+            self.pulse[S_ATT] = 1.0;
         }
         self.last_truth = tick.truth;
 
@@ -278,12 +318,12 @@ impl Session {
         put3(s, 30, n.accel_bias);
         put3(s, 33, n.gyro_bias);
         for (i, p) in self.pulse.iter().enumerate() {
-            s[36 + i] = *p;
+            s[36 + i] = *p; // nine sensor pulses at [36..45]
         }
         // 1σ position uncertainty (RMS of the three axes) — the ellipsoid's scale, for the plot.
         let trace = cov.m[0][0] + cov.m[1][1] + cov.m[2][2];
-        s[42] = (trace / 3.0).max(0.0).sqrt() as f32;
-        s[43] = self.inst_pos as f32;
+        s[45] = (trace / 3.0).max(0.0).sqrt() as f32;
+        s[46] = self.inst_pos as f32;
     }
 
     /// The per-frame scalars: pose, truth pose, position covariance, metrics, biases, activity.
