@@ -54,9 +54,14 @@ error-state Kalman filter* (2017), with the local (body-frame) angular error.
   - **UWB radio ranging** — scalar range to each of four fixed beacons; position-only, so it
     localises the vehicle with no GPS at all.
   - **Optical flow** — the body-frame horizontal velocity, observing velocity and attitude.
+  - **GPS Doppler velocity** — a direct world-frame velocity fix.
+  - **Doppler velocity (DVL / radar)** — the full body-frame velocity.
+  - **Attitude fix** — a direct orientation measurement (star tracker / vision), the standard
+    multiplicative attitude update.
 
   Joseph-form covariance update throughout, with the orientation covariance-reset Jacobian on
-  injection.
+  injection. A recorded reference dataset ([`data/reference-flight.csv`](data/reference-flight.csv))
+  and a `replay` command make the results independently reproducible.
 
 See [`docs/eskf.md`](docs/eskf.md) for the equations, worked and cited.
 
@@ -74,9 +79,11 @@ web/          Vite + TypeScript, a hand-written WebGL2 scene (no framework)
 ## Build
 
 ```
-cargo test --workspace           # the core, natively
-cargo run -p eskf-cli -- check   # the consistency gate
-cargo run -p eskf-cli -- scenarios
+cargo test --workspace                 # the core, natively (27 tests)
+cargo run -p eskf-cli -- check         # the Monte-Carlo NEES gate, pooled + over time
+cargo run -p eskf-cli -- scenarios     # RMSE across 9 sensor/failure scenarios
+cargo run -p eskf-cli -- record 15 data/reference-flight.csv   # record a dataset
+cargo run -p eskf-cli -- replay data/reference-flight.csv      # replay + score it
 
 ./scripts/build-wasm.sh          # regenerate web/src/wasm from the Rust
 cd web && npm install && npm run dev
