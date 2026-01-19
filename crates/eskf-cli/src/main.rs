@@ -11,7 +11,8 @@
 
 use eskf::sim::{SimConfig, BEACONS};
 use eskf::{
-    nees, position_nees, Eskf, InitialSigma, Nominal, Noise, Simulator, TrueState, MAG_REFERENCE,
+    nees, position_nees, Eskf, InitialSigma, Nominal, Noise, Simulator, Tick, TrueState,
+    MAG_REFERENCE,
 };
 
 const IMU_RATE: f64 = 200.0;
@@ -42,8 +43,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "plotdata" => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("paper/figdata");
+            if let Err(e) = cmd_plotdata(dir) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         other => {
-            eprintln!("unknown command '{other}'. Try: check | scenarios | record | replay");
+            eprintln!("unknown command '{other}'. Try: check | scenarios | record | replay | plotdata");
             std::process::exit(2);
         }
     }
@@ -253,6 +261,42 @@ fn cmd_replay(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Propagate on the IMU and apply whichever aiding measurements fired on this tick. The single
+/// place the filter is driven, shared by the gate, the scenarios, and the figure-data export, so
+/// every reported result comes from exactly the same update sequence.
+fn drive(f: &mut Eskf, tick: &Tick, cfg: &SimConfig) {
+    f.predict(tick.accel, tick.gyro, tick.dt);
+    if let Some(z) = tick.gps {
+        f.update_gps(z, cfg.gps_noise.max(1e-3));
+    }
+    if let Some(z) = tick.baro {
+        f.update_baro(z, cfg.baro_noise.max(1e-3));
+    }
+    if let Some(z) = tick.mag {
+        f.update_mag(z, MAG_REFERENCE, cfg.mag_noise.max(1e-4));
+    }
+    if let Some(z) = tick.lidar {
+        f.update_lidar_altimeter(z, cfg.lidar_noise.max(1e-3));
+    }
+    if let Some(ranges) = tick.uwb {
+        for (i, r) in ranges.iter().enumerate() {
+            f.update_range(BEACONS[i], *r, cfg.uwb_noise.max(1e-3));
+        }
+    }
+    if let Some(z) = tick.flow {
+        f.update_optical_flow(z, cfg.flow_noise.max(1e-3));
+    }
+    if let Some(z) = tick.gps_vel {
+        f.update_gps_velocity(z, cfg.gps_vel_noise.max(1e-3));
+    }
+    if let Some(z) = tick.dvl {
+        f.update_body_velocity(z, cfg.dvl_noise.max(1e-3));
+    }
+    if let Some(z) = tick.att {
+        f.update_attitude(z, cfg.att_noise.max(1e-4));
+    }
+}
+
 /// Run one flight, feeding every sensor, and return per-step NEES samples (position 3-DOF and
 /// full 15-DOF) taken after the filter has settled, plus final RMSE figures.
 struct RunResult {
@@ -281,36 +325,7 @@ fn run_flight(cfg: SimConfig, seed: u64, seconds: f64) -> RunResult {
 
     for k in 0..steps {
         let tick = sim.step();
-        f.predict(tick.accel, tick.gyro, tick.dt);
-        if let Some(z) = tick.gps {
-            f.update_gps(z, cfg.gps_noise.max(1e-3));
-        }
-        if let Some(z) = tick.baro {
-            f.update_baro(z, cfg.baro_noise.max(1e-3));
-        }
-        if let Some(z) = tick.mag {
-            f.update_mag(z, MAG_REFERENCE, cfg.mag_noise.max(1e-4));
-        }
-        if let Some(z) = tick.lidar {
-            f.update_lidar_altimeter(z, cfg.lidar_noise.max(1e-3));
-        }
-        if let Some(ranges) = tick.uwb {
-            for (i, r) in ranges.iter().enumerate() {
-                f.update_range(BEACONS[i], *r, cfg.uwb_noise.max(1e-3));
-            }
-        }
-        if let Some(z) = tick.flow {
-            f.update_optical_flow(z, cfg.flow_noise.max(1e-3));
-        }
-        if let Some(z) = tick.gps_vel {
-            f.update_gps_velocity(z, cfg.gps_vel_noise.max(1e-3));
-        }
-        if let Some(z) = tick.dvl {
-            f.update_body_velocity(z, cfg.dvl_noise.max(1e-3));
-        }
-        if let Some(z) = tick.att {
-            f.update_attitude(z, cfg.att_noise.max(1e-4));
-        }
+        drive(&mut f, &tick, &cfg);
 
         if k >= settle {
             let dp = sub(f.nom.p, tick.truth.p);
@@ -498,6 +513,128 @@ fn scenarios() {
         println!("  {name:<18} {:>10.3} {:>12.3} {:>12.3}", rp / n, rv / n, ra / n);
     }
     println!("\nGPS dropout inflates position error while attitude holds — inertial coasting, as expected.");
+}
+
+/// Writes the CSV series behind the paper's figures, all produced by the same `eskf` core the
+/// gate runs, so every plotted curve is real filter output:
+///   `nees_time.csv`  position and full-state NEES versus time, averaged over 40 flights;
+///   `envelope.csv`   one flight's position error against its own $\pm 3\sigma$ envelope;
+///   `drift.csv`      aided versus IMU-only (dead-reckoning) position error versus time.
+fn cmd_plotdata(dir: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let seconds = 30.0;
+    let cfg = full_config();
+
+    // NEES versus time, averaged across many flights so the curve is the ensemble mean the
+    // consistency band is defined against.
+    let runs = 40u64;
+    let mut acc: Vec<[f64; 3]> = Vec::new(); // [sum_pos, sum_full, count] per sample time
+    let mut times: Vec<f64> = Vec::new();
+    for seed in 0..runs {
+        let series = nees_series(cfg, seed * 2_654_435_761, seconds);
+        if acc.is_empty() {
+            times = series.iter().map(|s| s.0).collect();
+            acc = series.iter().map(|s| [s.1, s.2, 1.0]).collect();
+        } else {
+            for (a, s) in acc.iter_mut().zip(series.iter()) {
+                a[0] += s.1;
+                a[1] += s.2;
+                a[2] += 1.0;
+            }
+        }
+    }
+    let mut nees_csv = String::from("t,pos,full\n");
+    for (t, a) in times.iter().zip(acc.iter()) {
+        nees_csv.push_str(&format!("{:.2},{:.4},{:.4}\n", t, a[0] / a[2], a[1] / a[2]));
+    }
+    std::fs::write(format!("{dir}/nees_time.csv"), nees_csv).map_err(|e| e.to_string())?;
+
+    // One flight's position error against its own reported 3-sigma envelope.
+    let mut env_csv = String::from("t,ex,s3x,ez,s3z\n");
+    for (t, ex, s3x, ez, s3z) in envelope_series(cfg, 7, seconds) {
+        env_csv.push_str(&format!("{t:.3},{ex:.4},{s3x:.4},{ez:.4},{s3z:.4}\n"));
+    }
+    std::fs::write(format!("{dir}/envelope.csv"), env_csv).map_err(|e| e.to_string())?;
+
+    // Dead-reckoning: aided fusion versus IMU-only coasting.
+    let aided = drift_series(full_config(), 3, seconds);
+    let imu_cfg = SimConfig {
+        gps_enabled: false,
+        baro_enabled: false,
+        mag_enabled: false,
+        ..SimConfig::default()
+    };
+    let imu = drift_series(imu_cfg, 3, seconds);
+    let mut drift_csv = String::from("t,aided,imu_only\n");
+    for (a, b) in aided.iter().zip(imu.iter()) {
+        drift_csv.push_str(&format!("{:.3},{:.5},{:.5}\n", a.0, a.1, b.1));
+    }
+    std::fs::write(format!("{dir}/drift.csv"), drift_csv).map_err(|e| e.to_string())?;
+
+    println!("wrote nees_time.csv, envelope.csv, drift.csv to {dir}/");
+    Ok(())
+}
+
+/// Per-sample (time, position-NEES, full-state-NEES) after the filter settles.
+fn nees_series(cfg: SimConfig, seed: u64, seconds: f64) -> Vec<(f64, f64, f64)> {
+    let mut sim = Simulator::new(cfg, seed);
+    let mut f = Eskf::new(sim.sample_initial_nominal(InitialSigma::default()), InitialSigma::default(), filter_noise(&cfg));
+    let steps = (seconds * IMU_RATE) as usize;
+    let settle = (5.0 * IMU_RATE) as usize;
+    let mut out = Vec::new();
+    for k in 0..steps {
+        let tick = sim.step();
+        drive(&mut f, &tick, &cfg);
+        if k >= settle && k % 20 == 0 {
+            if let (Some(p), Some(fu)) = (
+                position_nees(&f.nom, &tick.truth, f.covariance()),
+                nees(&f.nom, &tick.truth, f.covariance()),
+            ) {
+                out.push((k as f64 / IMU_RATE, p, fu));
+            }
+        }
+    }
+    out
+}
+
+/// Per-sample (time, x-error, 3-sigma-x, z-error, 3-sigma-z) from t=0, including convergence.
+fn envelope_series(cfg: SimConfig, seed: u64, seconds: f64) -> Vec<(f64, f64, f64, f64, f64)> {
+    let mut sim = Simulator::new(cfg, seed);
+    let mut f = Eskf::new(sim.sample_initial_nominal(InitialSigma::default()), InitialSigma::default(), filter_noise(&cfg));
+    let steps = (seconds * IMU_RATE) as usize;
+    let mut out = Vec::new();
+    for k in 0..steps {
+        let tick = sim.step();
+        drive(&mut f, &tick, &cfg);
+        if k % 20 == 0 {
+            let p = f.covariance();
+            out.push((
+                k as f64 / IMU_RATE,
+                f.nom.p[0] - tick.truth.p[0],
+                3.0 * p.m[0][0].max(0.0).sqrt(),
+                f.nom.p[2] - tick.truth.p[2],
+                3.0 * p.m[2][2].max(0.0).sqrt(),
+            ));
+        }
+    }
+    out
+}
+
+/// Per-sample (time, position-error-norm) from t=0.
+fn drift_series(cfg: SimConfig, seed: u64, seconds: f64) -> Vec<(f64, f64)> {
+    let mut sim = Simulator::new(cfg, seed);
+    let mut f = Eskf::new(sim.sample_initial_nominal(InitialSigma::default()), InitialSigma::default(), filter_noise(&cfg));
+    let steps = (seconds * IMU_RATE) as usize;
+    let mut out = Vec::new();
+    for k in 0..steps {
+        let tick = sim.step();
+        drive(&mut f, &tick, &cfg);
+        if k % 20 == 0 {
+            let dp = sub(f.nom.p, tick.truth.p);
+            out.push((k as f64 / IMU_RATE, dot(dp, dp).sqrt()));
+        }
+    }
+    out
 }
 
 // --- χ² quantiles via the Wilson–Hilferty normal approximation (excellent for large k). ---
