@@ -28,8 +28,9 @@ Monte-Carlo consistency check — 40 flights of 30 s, all sensors on
 CONSISTENT — the filter's covariance matches its error. Gate PASSED.
 ```
 
-A full technical write-up — the derivation, the six measurement Jacobians, the NEES consistency
-methodology, and the results — is in **[`paper/ekf-sim.pdf`](paper/ekf-sim.pdf)**
+A full technical write-up — the error-state derivation, the nine measurement Jacobians, the
+observability analysis, the NEES/NIS consistency methodology, and the results (with figures generated
+directly by the filter) — is in **[`paper/ekf-sim.pdf`](paper/ekf-sim.pdf)**
 ([LaTeX source](paper/ekf-sim.tex)).
 
 ## The filter
@@ -84,6 +85,7 @@ cargo run -p eskf-cli -- check         # the Monte-Carlo NEES gate, pooled + ove
 cargo run -p eskf-cli -- scenarios     # RMSE across 9 sensor/failure scenarios
 cargo run -p eskf-cli -- record 15 data/reference-flight.csv   # record a dataset
 cargo run -p eskf-cli -- replay data/reference-flight.csv      # replay + score it
+cargo run -p eskf-cli -- plotdata paper/figdata               # regenerate the paper's figure data
 
 ./scripts/build-wasm.sh          # regenerate web/src/wasm from the Rust
 cd web && npm install && npm run dev
