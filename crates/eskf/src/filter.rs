@@ -65,10 +65,37 @@ impl Default for Noise {
     }
 }
 
+/// A record of the most recent measurement correction, for introspection and diagnostics: the
+/// measurement dimension, the innovation magnitude, the normalized innovation squared (NIS), and
+/// whether the NIS gate accepted it. The NIS is χ²-distributed with `dim` degrees of freedom for a
+/// consistent filter, so its running value is a live measure of innovation consistency.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UpdateStats {
+    pub dim: usize,
+    pub innovation_norm: f64,
+    pub nis: f64,
+    pub accepted: bool,
+}
+
 pub struct Eskf {
     pub nom: Nominal,
     pub p: Mat<N, N>,
     pub noise: Noise,
+    /// The most recent correction's diagnostics (see [`UpdateStats`]); `None` before any update.
+    pub last_update: Option<UpdateStats>,
+}
+
+/// Upper-tail χ²(0.99) quantiles for the small measurement dimensions used here — the threshold of
+/// the NIS outlier gate. A measurement whose NIS exceeds this is a 1-in-100 event under the model
+/// and is rejected as a likely outlier before it corrupts the state.
+pub fn nis_gate_threshold(dim: usize) -> f64 {
+    match dim {
+        1 => 6.635,
+        2 => 9.210,
+        3 => 11.345,
+        4 => 13.277,
+        _ => 5.0 + 2.1 * dim as f64,
+    }
 }
 
 impl Eskf {
@@ -86,7 +113,7 @@ impl Eskf {
         set(&mut p, ITH, sigma.orientation);
         set(&mut p, IAB, sigma.accel_bias);
         set(&mut p, IWB, sigma.gyro_bias);
-        Eskf { nom, p, noise }
+        Eskf { nom, p, noise, last_update: None }
     }
 
     /// Propagate with one IMU sample: integrate the nominal state and push the covariance
@@ -294,6 +321,22 @@ impl Eskf {
             Some(inv) => inv,
             None => return, // singular innovation — skip rather than corrupt the state
         };
+
+        // Normalized innovation squared: νᵀ S⁻¹ ν, χ²(M) for a consistent filter. A measurement far
+        // out in that distribution is a likely outlier; gate it out before it corrupts the state.
+        let sr = s_inv.mul(residual); // M×1
+        let mut nis = 0.0;
+        let mut innov_sq = 0.0;
+        for i in 0..M {
+            nis += residual.m[i][0] * sr.m[i][0];
+            innov_sq += residual.m[i][0] * residual.m[i][0];
+        }
+        let accepted = nis <= nis_gate_threshold(M);
+        self.last_update = Some(UpdateStats { dim: M, innovation_norm: innov_sq.sqrt(), nis, accepted });
+        if !accepted {
+            return; // NIS gate: reject the outlier, leave the state untouched
+        }
+
         let k = pht.mul(&s_inv); // N×M Kalman gain
         let dx = k.mul(residual); // N×1 error-state correction
         self.inject(&dx);
@@ -579,7 +622,10 @@ mod tests {
 
     #[test]
     fn gps_velocity_pulls_velocity_to_the_measurement() {
-        let nom = Nominal { v: [2.0, -1.0, 0.5], ..Nominal::at_rest([0.0; 3], Quat::IDENTITY) };
+        // A ~0.8 m/s error is a believable few-sigma innovation (velocity σ₀ = 0.3), so it clears
+        // the NIS gate; repeated fixes at zero must then drive it down — which only happens if the
+        // update's sign is right (a flipped sign diverges away from the measurement).
+        let nom = Nominal { v: [0.6, -0.4, 0.3], ..Nominal::at_rest([0.0; 3], Quat::IDENTITY) };
         let mut f = Eskf::new(nom, InitialSigma::default(), Noise::default());
         for _ in 0..80 {
             f.update_gps_velocity([0.0, 0.0, 0.0], 0.1);
@@ -589,11 +635,12 @@ mod tests {
 
     #[test]
     fn attitude_fix_converges_to_the_measurement() {
-        // Seed a ~20° orientation error; attitude fixes at truth must drive it down (which only
-        // happens if the update's sign is right — a flipped sign diverges).
+        // Seed a ~14° orientation error — a few times the initial orientation σ (0.1 rad), so the
+        // first innovation clears the NIS gate; attitude fixes at truth must then drive it down,
+        // which only happens if the update's sign is right (a flipped sign diverges).
         let truth = Quat::from_rotation_vector([0.1, -0.2, 0.15]);
         let nom = Nominal {
-            q: truth.mul(Quat::from_rotation_vector([0.35, 0.0, 0.0])),
+            q: truth.mul(Quat::from_rotation_vector([0.25, 0.0, 0.0])),
             ..Nominal::at_rest([0.0; 3], Quat::IDENTITY)
         };
         let mut f = Eskf::new(nom, InitialSigma::default(), Noise::default());
@@ -602,5 +649,16 @@ mod tests {
         }
         let err = v3::norm(boxminus(truth, f.nom.q)).to_degrees();
         assert!(err < 1.0, "attitude did not converge: {err}°");
+    }
+
+    #[test]
+    fn nis_gate_rejects_a_gross_outlier() {
+        // A measurement wildly inconsistent with the state (here a 50 m position jump against a 3 m
+        // position σ) has an enormous NIS and must be rejected, leaving the state untouched.
+        let nom = Nominal::at_rest([0.0, 0.0, 10.0], Quat::IDENTITY);
+        let mut f = Eskf::new(nom, InitialSigma::default(), Noise::default());
+        f.update_gps([50.0, 0.0, 10.0], 0.5);
+        assert!(f.last_update.is_some_and(|u| !u.accepted), "gate should reject the outlier");
+        assert!(f.nom.p[0].abs() < 1e-9, "state moved on a rejected measurement: {:?}", f.nom.p);
     }
 }

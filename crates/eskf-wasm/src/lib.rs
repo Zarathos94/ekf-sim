@@ -9,7 +9,10 @@
 //! The same `eskf` crate that passes the native NEES consistency gate runs here unchanged.
 
 use eskf::sim::BEACONS;
-use eskf::{Eskf, InitialSigma, Noise, SimConfig, Simulator, TrueState, MAG_REFERENCE};
+use eskf::{
+    error_state, nees, position_nees, Eskf, InitialSigma, Noise, SimConfig, Simulator, TrueState,
+    MAG_REFERENCE,
+};
 use wasm_bindgen::prelude::*;
 
 /// Trajectory history: 60 s at 50 Hz — two full orbits, so the divergence between the estimated
@@ -29,6 +32,16 @@ const S_GPS_VEL: usize = 6;
 const S_DVL: usize = 7;
 const S_ATT: usize = 8;
 const N_SENSORS: usize = 9;
+
+/// The most recent correction diagnostics for one sensor, mirrored from the filter's `last_update`
+/// so the analytics view can show a live per-sensor innovation and NIS.
+#[derive(Clone, Copy, Default)]
+struct SensorStat {
+    dim: f32,
+    nis: f32,
+    innov: f32,
+    accepted: f32,
+}
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -65,6 +78,7 @@ pub struct Session {
     ema_nees: f64,
     inst_pos: f64,
     pulse: [f32; N_SENSORS],
+    sensor_stats: [SensorStat; N_SENSORS],
 
     snapshot: Vec<f32>,
 }
@@ -91,6 +105,7 @@ impl Session {
             ema_nees: 3.0,
             inst_pos: 0.0,
             pulse: [0.0; N_SENSORS],
+            sensor_stats: [SensorStat::default(); N_SENSORS],
             snapshot: vec![0.0; SNAPSHOT_LEN],
         }
     }
@@ -109,6 +124,7 @@ impl Session {
         self.ema_nees = 3.0;
         self.inst_pos = 0.0;
         self.pulse = [0.0; N_SENSORS];
+        self.sensor_stats = [SensorStat::default(); N_SENSORS];
     }
 
     // --- Sensor noise (the simulator's actual noise; the filter's assumed noise tracks the IMU
@@ -230,41 +246,41 @@ impl Session {
         self.filter.predict(tick.accel, tick.gyro, tick.dt);
         if let Some(z) = tick.gps {
             self.filter.update_gps(z, self.cfg.gps_noise.max(1e-3));
-            self.pulse[S_GPS] = 1.0;
+            self.mark(S_GPS);
         }
         if let Some(z) = tick.baro {
             self.filter.update_baro(z, self.cfg.baro_noise.max(1e-3));
-            self.pulse[S_BARO] = 1.0;
+            self.mark(S_BARO);
         }
         if let Some(z) = tick.mag {
             self.filter.update_mag(z, MAG_REFERENCE, self.cfg.mag_noise.max(1e-4));
-            self.pulse[S_MAG] = 1.0;
+            self.mark(S_MAG);
         }
         if let Some(z) = tick.lidar {
             self.filter.update_lidar_altimeter(z, self.cfg.lidar_noise.max(1e-3));
-            self.pulse[S_LIDAR] = 1.0;
+            self.mark(S_LIDAR);
         }
         if let Some(ranges) = tick.uwb {
             for (i, r) in ranges.iter().enumerate() {
                 self.filter.update_range(BEACONS[i], *r, self.cfg.uwb_noise.max(1e-3));
             }
-            self.pulse[S_UWB] = 1.0;
+            self.mark(S_UWB);
         }
         if let Some(z) = tick.flow {
             self.filter.update_optical_flow(z, self.cfg.flow_noise.max(1e-3));
-            self.pulse[S_FLOW] = 1.0;
+            self.mark(S_FLOW);
         }
         if let Some(z) = tick.gps_vel {
             self.filter.update_gps_velocity(z, self.cfg.gps_vel_noise.max(1e-3));
-            self.pulse[S_GPS_VEL] = 1.0;
+            self.mark(S_GPS_VEL);
         }
         if let Some(z) = tick.dvl {
             self.filter.update_body_velocity(z, self.cfg.dvl_noise.max(1e-3));
-            self.pulse[S_DVL] = 1.0;
+            self.mark(S_DVL);
         }
         if let Some(z) = tick.att {
             self.filter.update_attitude(z, self.cfg.att_noise.max(1e-4));
-            self.pulse[S_ATT] = 1.0;
+            self.mark(S_ATT);
         }
         self.last_truth = tick.truth;
 
@@ -283,6 +299,70 @@ impl Session {
             push_trail(&mut self.truth_trail, tick.truth.p);
         }
         self.step_count += 1;
+    }
+
+    /// Flag a sensor as having just fired and mirror the filter's last-correction diagnostics into
+    /// its analytics slot.
+    fn mark(&mut self, sensor: usize) {
+        self.pulse[sensor] = 1.0;
+        if let Some(u) = self.filter.last_update {
+            self.sensor_stats[sensor] = SensorStat {
+                dim: u.dim as f32,
+                nis: u.nis as f32,
+                innov: u.innovation_norm as f32,
+                accepted: if u.accepted { 1.0 } else { 0.0 },
+            };
+        }
+    }
+
+    /// A richer, on-demand payload for the analytics view: the nominal state, the ground truth, the
+    /// 15-vector estimation error, the full 15×15 error covariance, the position and full-state
+    /// NEES, and each sensor's latest innovation/NIS. Computed only when the view asks for it, so
+    /// the 3D path pays nothing for it. Layout (all `f32`):
+    ///   [0..16]    nominal p(3) v(3) q(4) accel_bias(3) gyro_bias(3)
+    ///   [16..26]   truth   p(3) v(3) q(4)
+    ///   [26..41]   error   δp(3) δv(3) δθ(3) δa_b(3) δω_b(3)
+    ///   [41..266]  covariance P, row-major 15×15
+    ///   [266]      position NEES     [267] full-state NEES     [268] time (s)
+    ///   [269..305] per sensor ×9: dim, nis, innovation-norm, accepted(1/0)
+    pub fn analytics(&self) -> Vec<f32> {
+        let n = &self.filter.nom;
+        let t = &self.last_truth;
+        let mut o: Vec<f32> = Vec::with_capacity(305);
+        let push3 = |v: [f64; 3], o: &mut Vec<f32>| {
+            o.push(v[0] as f32);
+            o.push(v[1] as f32);
+            o.push(v[2] as f32);
+        };
+        push3(n.p, &mut o);
+        push3(n.v, &mut o);
+        o.extend_from_slice(&[n.q.w as f32, n.q.x as f32, n.q.y as f32, n.q.z as f32]);
+        push3(n.accel_bias, &mut o);
+        push3(n.gyro_bias, &mut o);
+        push3(t.p, &mut o);
+        push3(t.v, &mut o);
+        o.extend_from_slice(&[t.q.w as f32, t.q.x as f32, t.q.y as f32, t.q.z as f32]);
+
+        let e = error_state(n, t);
+        for i in 0..15 {
+            o.push(e.m[i][0] as f32);
+        }
+        let p = self.filter.covariance();
+        for row in &p.m {
+            for &v in row {
+                o.push(v as f32);
+            }
+        }
+        o.push(position_nees(n, t, p).unwrap_or(0.0) as f32);
+        o.push(nees(n, t, p).unwrap_or(0.0) as f32);
+        o.push(self.sim.time() as f32);
+        for st in &self.sensor_stats {
+            o.push(st.dim);
+            o.push(st.nis);
+            o.push(st.innov);
+            o.push(st.accepted);
+        }
+        o
     }
 
     fn write_snapshot(&mut self) {
