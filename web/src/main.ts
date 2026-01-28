@@ -33,11 +33,15 @@ async function main() {
     // Copy of the scalar snapshot (JS-owned), then fresh views over the trails in wasm memory —
     // recreated every frame so a heap growth never leaves us reading a detached buffer.
     const snapshot = session.snapshot()
-    const estTrail = new Float32Array(memory.buffer, session.est_trail_ptr(), session.est_trail_len())
-    const truthTrail = new Float32Array(memory.buffer, session.truth_trail_ptr(), session.truth_trail_len())
+    ui.updateReadouts(snapshot) // the rail's consistency plot stays live in either view
 
-    scene.render({ estTrail, truthTrail, snapshot })
-    ui.updateReadouts(snapshot)
+    if (ui.activeView === '3d') {
+      const estTrail = new Float32Array(memory.buffer, session.est_trail_ptr(), session.est_trail_len())
+      const truthTrail = new Float32Array(memory.buffer, session.truth_trail_ptr(), session.truth_trail_len())
+      scene.render({ estTrail, truthTrail, snapshot })
+    } else {
+      ui.analytics.update(session.analytics(), !ui.paused)
+    }
     requestAnimationFrame(frame)
   }
   requestAnimationFrame(frame)

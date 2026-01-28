@@ -3,6 +3,7 @@
 //! own 3σ envelope — the consistency claim, made visible. Pure DOM, no framework.
 
 import type { Session } from './wasm/eskf_wasm.js'
+import { Analytics } from './analytics.js'
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -53,6 +54,8 @@ const PRESETS: Preset[] = [
 
 export class Ui {
   readonly canvas: HTMLCanvasElement
+  readonly analytics = new Analytics()
+  activeView: '3d' | 'analytics' = '3d'
   paused = false
   onReset: () => void = () => {}
   onExaggerate: (n: number) => void = () => {}
@@ -93,6 +96,27 @@ export class Ui {
     neesM.value.prepend(this.rNeesDot)
     metrics.append(posM.wrap, attM.wrap, neesM.wrap, timeM.wrap)
     stage.append(metrics)
+
+    // View switcher: the 3D stage, or the numeric analytics panel over the same area.
+    this.analytics.root.style.display = 'none'
+    stage.append(this.analytics.root)
+    const tabs = el('div', 'tabs')
+    const t3d = el('button', 'tab active', '3D view')
+    const tan = el('button', 'tab', 'Analytics')
+    const setView = (v: '3d' | 'analytics') => {
+      this.activeView = v
+      const on3d = v === '3d'
+      t3d.classList.toggle('active', on3d)
+      tan.classList.toggle('active', !on3d)
+      this.analytics.root.style.display = on3d ? 'none' : 'block'
+      hud.style.display = on3d ? '' : 'none'
+      metrics.style.display = on3d ? '' : 'none'
+    }
+    t3d.addEventListener('click', () => setView('3d'))
+    tan.addEventListener('click', () => setView('analytics'))
+    tabs.append(t3d, tan)
+    stage.append(tabs)
+
     this.rPos = posM.value
     this.rAtt = attM.value
     this.rNees = neesM.value
@@ -179,6 +203,7 @@ export class Ui {
     resetBtn.addEventListener('click', () => {
       session.reset()
       this.plot.clear()
+      this.analytics.clear()
       this.onReset()
     })
     buttons.append(pauseBtn, resetBtn)
