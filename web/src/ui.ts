@@ -122,21 +122,29 @@ export class Ui {
     this.rNees = neesM.value
     this.rTime = timeM.value
 
-    // --- Rail: title, sensors, noise, consistency plot, run controls. ---
+    // --- Rail: a masthead over hairline-separated control sections. ---
     const rail = el('div', 'rail')
-    const title = el('div', 'title')
-    title.append(
-      el('h1', undefined, 'Sensor Fusion Playground'),
-      el('p', undefined, 'Error-state EKF · IMU + GPS + baro + mag + LiDAR + UWB + flow'),
+    const mast = el('div', 'mast')
+    const mrow = el('div', 'mast-row')
+    mrow.append(
+      el('span', 'mast-logo', '◈'),
+      el('span', 'mast-word', 'ESKF'),
+      el('span', 'mast-tag', 'sensor-fusion lab'),
     )
-    rail.append(title)
-
-    rail.append(sectionLabel('Display'))
-    rail.append(
-      slider('Error exaggeration', 1, 20, 4, 1, '×', (v) => this.onExaggerate(v)),
+    mast.append(
+      mrow,
+      el(
+        'div',
+        'mast-desc',
+        'A quaternion error-state Kalman filter fusing an IMU with GPS, baro, mag, LiDAR, UWB, optical flow, DVL and attitude fixes.',
+      ),
     )
+    const body = el('div', 'rail-body')
 
-    rail.append(sectionLabel('Scenario preset'))
+    body.append(section('01', 'Display'))
+    body.append(slider('Error exaggeration', 1, 20, 4, 1, '×', (v) => this.onExaggerate(v)))
+
+    body.append(section('02', 'Scenario'))
     const presetSel = el('select', 'preset')
     presetSel.append(el('option', undefined, '— choose a preset —'))
     for (const p of PRESETS) presetSel.append(el('option', undefined, p.name))
@@ -148,35 +156,37 @@ export class Ui {
         SENSORS[i]!.set(session, p.on[i]!)
       }
     })
-    rail.append(presetSel)
+    body.append(presetSel)
 
-    rail.append(sectionLabel('Sensors — toggle to see what each one buys'))
+    body.append(section('03', 'Sensors'))
     for (const def of SENSORS) {
       def.set(session, def.on)
-      const row = el('label', 'sensor')
+      const row = el('label', 'sw')
       const input = el('input')
       input.type = 'checkbox'
       input.checked = def.on
       input.addEventListener('change', () => def.set(session, input.checked))
       this.sensorInputs.push(input)
-      const dot = el('span', 'sdot')
+      const track = el('span', 'sw-track')
+      track.append(el('span', 'sw-knob'))
+      const dot = el('span', 'sw-dot')
       dot.style.background = def.color
       dot.style.opacity = '0.15'
       this.dots.push(dot)
-      row.append(input, el('span', 'sname', def.label), dot)
-      rail.append(row)
+      row.append(input, track, el('span', 'sw-name', def.label), dot)
+      body.append(row)
     }
 
-    rail.append(sectionLabel('IMU noise & bias drift'))
-    rail.append(
+    body.append(section('04', 'IMU noise & bias drift'))
+    body.append(
       slider('Accel noise', 0.0, 1.0, 0.06, 0.005, 'm/s²', (v) => session.set_accel_noise(v)),
       slider('Gyro noise', 0.0, 0.08, 0.004, 0.001, 'rad/s', (v) => session.set_gyro_noise(v)),
       slider('Accel bias drift', 0.0, 0.03, 0.002, 0.0005, 'm/s²/√s', (v) => session.set_accel_bias_walk(v)),
       slider('Gyro bias drift', 0.0, 0.004, 0.0002, 0.0001, 'rad/s/√s', (v) => session.set_gyro_bias_walk(v)),
     )
 
-    rail.append(sectionLabel('Aiding-sensor noise'))
-    rail.append(
+    body.append(section('05', 'Aiding-sensor noise'))
+    body.append(
       slider('GPS noise', 0.1, 8.0, 0.8, 0.1, 'm', (v) => session.set_gps_noise(v)),
       slider('LiDAR noise', 0.02, 2.0, 0.15, 0.02, 'm', (v) => session.set_lidar_noise(v)),
       slider('UWB noise', 0.05, 3.0, 0.35, 0.05, 'm', (v) => session.set_uwb_noise(v)),
@@ -186,12 +196,14 @@ export class Ui {
       slider('Attitude-fix noise', 0.002, 0.1, 0.01, 0.002, 'rad', (v) => session.set_att_noise(v)),
     )
 
-    rail.append(sectionLabel('Consistency — error vs 3σ'))
+    body.append(section('06', 'Consistency · error vs 3σ'))
     this.plot = new ConsistencyPlot()
-    rail.append(this.plot.canvas)
-    rail.append(el('p', 'plotcap', 'The error (white) should stay inside the ±3σ envelope (orange) the filter reports.'))
+    body.append(this.plot.canvas)
+    body.append(
+      el('p', 'plotcap', 'The error (white) should stay inside the ±3σ envelope (amber) the filter reports.'),
+    )
 
-    rail.append(sectionLabel('Run'))
+    body.append(section('07', 'Run'))
     const buttons = el('div', 'buttons')
     const pauseBtn = el('button', 'btn', 'Pause')
     pauseBtn.addEventListener('click', () => {
@@ -207,16 +219,17 @@ export class Ui {
       this.onReset()
     })
     buttons.append(pauseBtn, resetBtn)
-    rail.append(buttons)
+    body.append(buttons)
 
-    rail.append(
+    body.append(
       el(
         'p',
         'hint',
-        "Drag to orbit, scroll to zoom. The red spear is the position error, exaggerated ×4 by default — set it to ×1 for true scale. Turn every aiding sensor off to watch the estimate dead-reckon and drift away; turn GPS off and UWB on to stay localised with no GPS.",
+        'Drag to orbit, scroll to zoom. The red spear is the position error, exaggerated ×4 by default — set it to ×1 for true scale. Turn every aiding sensor off to watch the estimate dead-reckon and drift; drop GPS and turn UWB on to stay localised with no GPS. The Analytics tab shows the covariance, NEES and per-sensor NIS in numbers.',
       ),
     )
 
+    rail.append(mast, body)
     root.append(stage, rail)
   }
 
@@ -244,10 +257,12 @@ export class Ui {
     this.rNeesDot.title = hint
     this.rTime.textContent = `${t.toFixed(1)} s`
 
-    // Sensor activity dots, driven by the decaying pulses.
+    // Sensor activity dots, driven by the decaying pulses — they light and glow on each fix.
     for (let i = 0; i < this.dots.length; i++) {
       const p = s[36 + i]!
-      this.dots[i]!.style.opacity = (0.15 + 0.85 * p).toFixed(2)
+      const dot = this.dots[i]!
+      dot.style.opacity = (0.18 + 0.82 * p).toFixed(2)
+      dot.style.boxShadow = p > 0.15 ? `0 0 ${(7 * p).toFixed(1)}px ${SENSORS[i]!.color}` : 'none'
     }
 
     if (!this.paused) this.plot.push(instErr, sigma3)
@@ -295,7 +310,7 @@ class ConsistencyPlot {
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, w, h)
-    ctx.fillStyle = '#0d1320'
+    ctx.fillStyle = '#0c0e13'
     ctx.fillRect(0, 0, w, h)
 
     const n = this.err.length
@@ -313,9 +328,9 @@ class ConsistencyPlot {
     ctx.lineTo(x(n - 1), h)
     ctx.lineTo(x(0), h)
     ctx.closePath()
-    ctx.fillStyle = 'rgba(255,190,89,0.16)'
+    ctx.fillStyle = 'rgba(244,184,96,0.15)'
     ctx.fill()
-    ctx.strokeStyle = 'rgba(255,190,89,0.85)'
+    ctx.strokeStyle = 'rgba(244,184,96,0.85)'
     ctx.lineWidth = 1
     ctx.beginPath()
     ctx.moveTo(x(0), y(this.sig[0]!))
@@ -349,11 +364,17 @@ function metric(label: string): { wrap: HTMLElement; value: HTMLElement } {
   return { wrap, value: v }
 }
 
-function sectionLabel(text: string): HTMLElement {
-  return el('div', 'section', text)
+/** A numbered, hairline section divider (the number is drawn by CSS from data-n). */
+function section(n: string, text: string): HTMLElement {
+  const s = el('div', 'section', text)
+  s.dataset.n = n
+  return s
 }
 
-/** A labelled range with a synced, editable number field and a unit — all aligned. */
+/**
+ * A machined control: the name, a `[− value +]` stepper (no ugly native spin buttons — the value
+ * is editable and the −/+ keys step by the given increment), a unit, and a range slider, all synced.
+ */
 function slider(
   label: string,
   min: number,
@@ -363,43 +384,52 @@ function slider(
   unit: string,
   onInput: (v: number) => void,
 ): HTMLElement {
-  const wrap = el('div', 'slider')
-  const head = el('div', 'slabel')
-  const num = el('input', 'snum')
+  const decimals = (String(step).split('.')[1] ?? '').length
+  const clamp = (v: number) => Number(Math.min(max, Math.max(min, v)).toFixed(decimals))
+
+  const wrap = el('div', 'ctl')
+  const top = el('div', 'ctl-top')
+  const name = el('span', 'ctl-name', label)
+  name.title = label
+
+  const stepper = el('div', 'stepper')
+  const minus = el('button', 'step minus', '−')
+  minus.type = 'button'
+  const num = el('input', 'stepval')
   num.type = 'number'
   num.min = String(min)
   num.max = String(max)
   num.step = String(step)
   num.value = String(value)
-  head.append(el('span', 'sname2', label), num, el('span', 'sunit', unit))
+  const plus = el('button', 'step plus', '+')
+  plus.type = 'button'
+  stepper.append(minus, num, plus)
 
-  const range = el('input', 'srange')
+  top.append(name, stepper, el('span', 'ctl-unit', unit))
+
+  const range = el('input')
   range.type = 'range'
   range.min = String(min)
   range.max = String(max)
   range.step = String(step)
   range.value = String(value)
 
-  const clampV = (v: number) => Math.min(max, Math.max(min, v))
-  range.addEventListener('input', () => {
-    const v = Number(range.value)
-    num.value = String(v)
-    onInput(v)
-  })
+  // range/stepper are the source of truth; `keepText` leaves the number field alone while typing.
+  const apply = (v: number, keepText = false) => {
+    const c = clamp(v)
+    range.value = String(c)
+    if (!keepText) num.value = String(c)
+    onInput(c)
+  }
+  range.addEventListener('input', () => apply(Number(range.value)))
+  minus.addEventListener('click', () => apply(Number(range.value) - step))
+  plus.addEventListener('click', () => apply(Number(range.value) + step))
   num.addEventListener('input', () => {
     const raw = Number(num.value)
-    if (Number.isNaN(raw)) return
-    const v = clampV(raw)
-    range.value = String(v)
-    onInput(v)
+    if (!Number.isNaN(raw)) apply(raw, true)
   })
-  num.addEventListener('blur', () => {
-    const v = clampV(Number(num.value) || min)
-    num.value = String(v)
-    range.value = String(v)
-    onInput(v)
-  })
+  num.addEventListener('blur', () => apply(Number(num.value) || min))
 
-  wrap.append(head, range)
+  wrap.append(top, range)
   return wrap
 }
