@@ -47,6 +47,13 @@ const SENSOR_NAMES = [
 // χ²(0.99) gate thresholds by measurement dimension — matches the Rust core's nis_gate_threshold.
 const GATE: Record<number, number> = { 1: 6.635, 2: 9.21, 3: 11.345, 4: 13.277 }
 
+// scope-trace palette (mirrors the CSS custom properties)
+const CY = '#46cde6'
+const MN = '#57e3a1'
+const AM = '#f4b860'
+const CO = '#ff6b78'
+const VI = '#ac8dff'
+
 interface Block {
   name: string
   off: number // error-state / covariance offset
@@ -97,6 +104,12 @@ export class Analytics {
   private readonly errChart: LineChart
   private readonly neesChart: LineChart
   private readonly rateChart: LineChart
+  private readonly sigChart: LineChart
+  private readonly abChart: LineChart
+  private readonly gbChart: LineChart
+  private readonly nisChart: LineChart
+  private readonly trChart: LineChart
+  private readonly grid: HTMLElement
 
   constructor() {
     this.root = el('div', 'analytics')
@@ -117,13 +130,17 @@ export class Analytics {
       dims.append(chip)
     }
     head.append(dims)
+    head.append(el('div', 'an-hint', '⠿ drag a card by its handle to rearrange'))
     this.root.append(head)
 
     const grid = el('div', 'an-grid')
+    this.grid = grid
     this.root.append(grid)
 
-    // --- State & uncertainty table ---
-    const stateCard = card('State, uncertainty & error  (x̂ = truth ⊞ error)')
+    const cards: { key: string; el: HTMLElement }[] = []
+
+    // --- State & uncertainty table (full width) ---
+    const stateCard = card('state', 'State · uncertainty · error   (x̂ = truth ⊞ error)', true)
     const table = el('table', 'an-table')
     const thead = el('tr')
     for (const h of ['Block', 'dim', 'estimate  x̂', '1σ = √diag(P)', 'error  e = x̂ ⊟ x']) {
@@ -141,38 +158,63 @@ export class Analytics {
       this.cells.push({ est, sig, err })
     }
     stateCard.body.append(table)
-    stateCard.body.append(el('div', 'an-note', 'Units per row; orientation shown as roll/pitch/yaw and its error in degrees.'))
-    grid.append(stateCard.card)
+    stateCard.body.append(el('div', 'an-note', 'Units per row; orientation as roll/pitch/yaw, its error in degrees.'))
+    cards.push({ key: 'state', el: stateCard.card })
 
     // --- Line charts ---
-    const errCard = card('Position error components vs time  (m)')
-    this.errChart = new LineChart(['eₓ', 'e_y', 'e_z'], ['#73bfff', '#5be68d', '#ff8f6b'], { symmetric: true })
+    const errCard = card('poserr', 'Position error components   (m)')
+    this.errChart = new LineChart(['eₓ', 'e_y', 'e_z'], [CY, MN, CO], { symmetric: true })
     errCard.body.append(this.errChart.canvas, this.errChart.legend)
-    grid.append(errCard.card)
+    cards.push({ key: 'poserr', el: errCard.card })
 
-    const neesCard = card('Consistency: NEES ÷ dof  (should hover at 1)')
-    this.neesChart = new LineChart(['position ÷ 3', 'full ÷ 15'], ['#73bfff', '#ff6b6b'], {
+    const sigCard = card('possig', 'Position uncertainty  1σ = √diag(P)   (m)')
+    this.sigChart = new LineChart(['σₓ', 'σ_y', 'σ_z'], [CY, MN, CO], { ymin: 0 })
+    sigCard.body.append(this.sigChart.canvas, this.sigChart.legend)
+    cards.push({ key: 'possig', el: sigCard.card })
+
+    const neesCard = card('nees', 'Consistency · NEES ÷ dof   (hover at 1)')
+    this.neesChart = new LineChart(['position ÷ 3', 'full ÷ 15'], [CY, CO], {
       expected: 1,
       band: [0.55, 1.45],
       ymin: 0,
       ymax: 2.4,
     })
     neesCard.body.append(this.neesChart.canvas, this.neesChart.legend)
-    grid.append(neesCard.card)
+    cards.push({ key: 'nees', el: neesCard.card })
 
-    const rateCard = card('Velocity & attitude error vs time')
-    this.rateChart = new LineChart(['‖v‖ err (m/s)', 'att err (°)'], ['#ffbe59', '#c78bff'], { ymin: 0 })
+    const nisCard = card('nis', 'Innovation consistency · max NIS vs gate')
+    this.nisChart = new LineChart(['max NIS', 'gate χ²₃'], [CY, CO], { ymin: 0, ymax: 13 })
+    nisCard.body.append(this.nisChart.canvas, this.nisChart.legend)
+    cards.push({ key: 'nis', el: nisCard.card })
+
+    const rateCard = card('velatt', 'Velocity & attitude error')
+    this.rateChart = new LineChart(['‖v‖ err (m/s)', 'att err (°)'], [AM, VI], { ymin: 0 })
     rateCard.body.append(this.rateChart.canvas, this.rateChart.legend)
-    grid.append(rateCard.card)
+    cards.push({ key: 'velatt', el: rateCard.card })
+
+    const trCard = card('trace', 'Total uncertainty · tr(P)')
+    this.trChart = new LineChart(['tr(P)'], [AM], { ymin: 0 })
+    trCard.body.append(this.trChart.canvas, this.trChart.legend)
+    cards.push({ key: 'trace', el: trCard.card })
+
+    const abCard = card('abias', 'Accelerometer-bias estimate   (m/s²)')
+    this.abChart = new LineChart(['b_ax', 'b_ay', 'b_az'], [CY, MN, CO], { symmetric: true })
+    abCard.body.append(this.abChart.canvas, this.abChart.legend)
+    cards.push({ key: 'abias', el: abCard.card })
+
+    const gbCard = card('gbias', 'Gyroscope-bias estimate   (rad/s)')
+    this.gbChart = new LineChart(['b_gx', 'b_gy', 'b_gz'], [CY, MN, CO], { symmetric: true })
+    gbCard.body.append(this.gbChart.canvas, this.gbChart.legend)
+    cards.push({ key: 'gbias', el: gbCard.card })
 
     // --- Covariance correlation heatmap ---
-    const heatCard = card('Error-covariance correlation  ρ(i,j)  (15 × 15)')
+    const heatCard = card('heat', 'Error-covariance correlation  ρ(i,j)   (15 × 15)')
     this.heat = new Heatmap()
     heatCard.body.append(this.heat.canvas, this.heat.legend())
-    grid.append(heatCard.card)
+    cards.push({ key: 'heat', el: heatCard.card })
 
-    // --- Measurement update recursion + per-sensor NIS ---
-    const updCard = card('Measurement update — computed every correction')
+    // --- Measurement update recursion + per-sensor NIS (full width) ---
+    const updCard = card('update', 'Measurement update — every correction', true)
     const rec = el('div', 'an-rec')
     rec.innerHTML = [
       '<div>y = z − h(x̂)<span>innovation, m×1</span></div>',
@@ -202,13 +244,102 @@ export class Analytics {
       this.sensorRows.push({ dim, innov, nis, gate, verdict })
     }
     updCard.body.append(stable)
-    grid.append(updCard.card)
+    cards.push({ key: 'update', el: updCard.card })
+
+    this.mount(cards)
+  }
+
+  private charts(): LineChart[] {
+    return [
+      this.errChart,
+      this.sigChart,
+      this.neesChart,
+      this.nisChart,
+      this.rateChart,
+      this.trChart,
+      this.abChart,
+      this.gbChart,
+    ]
   }
 
   clear() {
-    this.errChart.clear()
-    this.neesChart.clear()
-    this.rateChart.clear()
+    for (const c of this.charts()) c.clear()
+  }
+
+  // --- card ordering: honour a saved arrangement, then let the user drag to rearrange ---
+
+  private mount(cards: { key: string; el: HTMLElement }[]) {
+    const byKey = new Map(cards.map((c) => [c.key, c.el]))
+    const saved = this.loadOrder()
+    const order = [
+      ...saved.filter((k) => byKey.has(k)),
+      ...cards.filter((c) => !saved.includes(c.key)).map((c) => c.key),
+    ]
+    for (const k of order) this.grid.append(byKey.get(k)!)
+    this.wireDnd()
+  }
+
+  private wireDnd() {
+    const grid = this.grid
+    let dragEl: HTMLElement | null = null
+    grid.querySelectorAll<HTMLElement>('.an-card').forEach((card) => {
+      card.addEventListener('dragstart', (e) => {
+        dragEl = card
+        card.classList.add('dragging')
+        ;(e as DragEvent).dataTransfer!.effectAllowed = 'move'
+      })
+      card.addEventListener('dragend', () => {
+        card.classList.remove('dragging')
+        dragEl = null
+        this.persistOrder()
+      })
+    })
+    grid.addEventListener('dragover', (e) => {
+      e.preventDefault()
+      if (!dragEl) return
+      const de = e as DragEvent
+      const target = this.dropTarget(de.clientX, de.clientY, dragEl)
+      if (target === dragEl) return
+      grid.insertBefore(dragEl, target)
+    })
+  }
+
+  /** The card the dragged tile should be inserted before (null → append), by nearest centre. */
+  private dropTarget(x: number, y: number, dragEl: HTMLElement): HTMLElement | null {
+    const cards = [...this.grid.querySelectorAll<HTMLElement>('.an-card')].filter((c) => c !== dragEl)
+    let best: HTMLElement | null = null
+    let bestDist = Infinity
+    let before = true
+    for (const c of cards) {
+      const r = c.getBoundingClientRect()
+      const cx = r.left + r.width / 2
+      const cy = r.top + r.height / 2
+      const d = Math.hypot(x - cx, y - cy)
+      if (d < bestDist) {
+        bestDist = d
+        best = c
+        before = y < cy - 8 || (y <= r.bottom && x < cx)
+      }
+    }
+    if (!best) return null
+    return before ? best : (best.nextElementSibling as HTMLElement | null)
+  }
+
+  private loadOrder(): string[] {
+    try {
+      return JSON.parse(localStorage.getItem('eskf.analytics.order') ?? '[]') as string[]
+    } catch {
+      return []
+    }
+  }
+
+  private persistOrder() {
+    const keys = [...this.grid.querySelectorAll<HTMLElement>('.an-card')].map((c) => c.dataset.key ?? '')
+    try {
+      localStorage.setItem('eskf.analytics.order', JSON.stringify(keys))
+    } catch {
+      /* storage unavailable — ordering just won't persist */
+    }
   }
 
   /** Feed one analytics payload; `push` advances the scrolling charts only when running. */
@@ -223,22 +354,31 @@ export class Analytics {
       c.err.textContent = [0, 1, 2].map((k) => f(a[ERR + b.off + k]! * b.scale, d)).join('  ')
     }
 
-    // errors (per-axis position error is the error-state δp)
-    if (push) {
-      this.errChart.push([a[ERR]!, a[ERR + 1]!, a[ERR + 2]!])
-      this.neesChart.push([a[NEES_POS]! / 3, a[NEES_FULL]! / 15])
-      const ve = Math.hypot(a[ERR + 3]!, a[ERR + 4]!, a[ERR + 5]!)
-      const ae = Math.hypot(a[ERR + 6]!, a[ERR + 7]!, a[ERR + 8]!) * RAD
-      this.rateChart.push([ve, ae])
+    // total uncertainty tr(P), and the largest NIS among sensors that fired — both plotted below.
+    let trace = 0
+    for (let i = 0; i < N; i++) trace += cov(a, i, i)
+    let maxNis = 0
+    for (let i = 0; i < SENSOR_NAMES.length; i++) {
+      if (a[SENSORS + i * 4]! > 0) maxNis = Math.max(maxNis, a[SENSORS + i * 4 + 1]!)
     }
-    this.errChart.draw()
-    this.neesChart.draw()
-    this.rateChart.draw()
+
+    if (push) {
+      this.errChart.push([a[ERR]!, a[ERR + 1]!, a[ERR + 2]!]) // δp per axis
+      this.sigChart.push([sigma(a, 0), sigma(a, 1), sigma(a, 2)]) // √diag(P) for p
+      this.neesChart.push([a[NEES_POS]! / 3, a[NEES_FULL]! / 15])
+      this.nisChart.push([maxNis, GATE[3]!])
+      this.rateChart.push([
+        Math.hypot(a[ERR + 3]!, a[ERR + 4]!, a[ERR + 5]!),
+        Math.hypot(a[ERR + 6]!, a[ERR + 7]!, a[ERR + 8]!) * RAD,
+      ])
+      this.trChart.push([trace])
+      this.abChart.push([a[NOM_AB]!, a[NOM_AB + 1]!, a[NOM_AB + 2]!])
+      this.gbChart.push([a[NOM_GB]!, a[NOM_GB + 1]!, a[NOM_GB + 2]!])
+    }
+    for (const c of this.charts()) c.draw()
 
     this.heat.draw(a)
 
-    let trace = 0
-    for (let i = 0; i < N; i++) trace += cov(a, i, i)
     this.traceEl.textContent = `tr(P) = ${trace.toExponential(2)}   ·   position NEES ${f(a[NEES_POS]!, 2)} (exp 3)   ·   full-state NEES ${f(a[NEES_FULL]!, 2)} (exp 15)`
 
     for (let i = 0; i < SENSOR_NAMES.length; i++) {
@@ -267,11 +407,16 @@ export class Analytics {
   }
 }
 
-function card(title: string): { card: HTMLElement; body: HTMLElement } {
-  const c = el('section', 'an-card')
-  c.append(el('div', 'an-card-title', title))
+function card(key: string, title: string, wide = false): { card: HTMLElement; body: HTMLElement } {
+  const c = el('section', wide ? 'an-card wide' : 'an-card')
+  c.dataset.key = key
+  c.draggable = true
+  const t = el('div', 'an-card-title')
+  const grip = el('span', 'an-grip', '⠿')
+  grip.title = 'drag to rearrange'
+  t.append(grip, el('span', undefined, title))
   const body = el('div', 'an-card-body')
-  c.append(body)
+  c.append(t, body)
   return { card: c, body }
 }
 
